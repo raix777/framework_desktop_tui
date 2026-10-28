@@ -9,6 +9,9 @@
 //! and translates key presses into changes:
 //! - `1`..`8` — select the LED with that number (no fan write needed)
 //! - `r`/`R`, `g`/`G`, `b`/`B` — increase / decrease the selected LED's channel
+//! - `t` — toggle the rotation: the colors travel around the ring, one
+//!   position per step (the TUI steps them every 1/8 s while it is on)
+//! - `s` — flip the rotation direction ([`RotationDirection`])
 
 use crate::fan::{Color, LED_COUNT};
 
@@ -32,6 +35,31 @@ impl Channel {
             Channel::Blue => &mut color.b,
         };
         *channel = (*channel as i16 + step).clamp(0, 255) as u8;
+    }
+}
+
+/// The way the colors travel around the ring while rotating.
+///
+/// The LEDs sit on the ring with LED 1 at 12 o'clock and the rest running
+/// counter-clockwise, so "clockwise" means the colors move 1 → 8 → 7 → …:
+/// the color of LED `i` lands on the position of LED `i - 1` (with LED 1's
+/// color wrapping around to LED 8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RotationDirection {
+    /// Clockwise: LED 1's color moves to LED 8, LED 2's to LED 1, and so on.
+    Clockwise,
+    /// Counter-clockwise: LED 1's color moves to LED 2, LED 2's to LED 3,
+    /// and so on.
+    CounterClockwise,
+}
+
+impl RotationDirection {
+    /// The other direction.
+    pub fn flipped(self) -> Self {
+        match self {
+            Self::Clockwise => Self::CounterClockwise,
+            Self::CounterClockwise => Self::Clockwise,
+        }
     }
 }
 
@@ -81,6 +109,11 @@ pub struct LedBank {
     /// When true, color changes apply to every LED instead of just the
     /// selected one. Off by default.
     all_mode: bool,
+    /// When true, the colors travel around the ring: the TUI calls
+    /// [`rotate`](Self::rotate) every 1/8 s. Off by default.
+    rotation: bool,
+    /// The direction the colors travel while rotating.
+    direction: RotationDirection,
 }
 
 impl LedBank {
@@ -92,6 +125,8 @@ impl LedBank {
             leds,
             selected: 0,
             all_mode: false,
+            rotation: false,
+            direction: RotationDirection::Clockwise,
         }
     }
 
@@ -121,6 +156,47 @@ impl LedBank {
     pub fn toggle_all(&mut self) -> bool {
         self.all_mode = !self.all_mode;
         self.all_mode
+    }
+
+    /// Whether the colors are rotating around the ring.
+    ///
+    /// Off by default; the `t` key toggles it.
+    pub fn rotation_on(&self) -> bool {
+        self.rotation
+    }
+
+    /// Toggle the rotation. Returns the new state (`true` = on).
+    pub fn toggle_rotation(&mut self) -> bool {
+        self.rotation = !self.rotation;
+        self.rotation
+    }
+
+    /// The direction the colors travel while rotating (clockwise by default).
+    pub fn rotation_direction(&self) -> RotationDirection {
+        self.direction
+    }
+
+    /// Flip the rotation direction (clockwise ↔ counter-clockwise).
+    pub fn flip_direction(&mut self) {
+        self.direction = self.direction.flipped();
+    }
+
+    /// Shift every LED's color one position around the ring in the current
+    /// direction: clockwise, the color of LED `i` moves to the position of
+    /// LED `i - 1` (LED 1's color lands on LED 8); counter-clockwise, LED
+    /// `i`'s color moves to LED `i + 1` (LED 1's color lands on LED 2).
+    pub fn rotate(&mut self) {
+        let colors: [Color; LED_COUNT] = std::array::from_fn(|i| self.leds[i].color);
+        // Clockwise: position `i` receives the color that sat at `i + 1`
+        // (LED 1's color wraps around to LED 8). Counter-clockwise: it
+        // receives the color that sat at `i - 1`.
+        let from = match self.direction {
+            RotationDirection::Clockwise => 1,
+            RotationDirection::CounterClockwise => LED_COUNT - 1,
+        };
+        for index in 0..LED_COUNT {
+            self.leds[index].color = colors[(index + from) % LED_COUNT];
+        }
     }
 
     /// Iterate the LEDs as `(0-based index, &Led)` in ring order.
@@ -277,6 +353,103 @@ mod tests {
         assert!(bank.all_mode());
         assert!(!bank.toggle_all(), "second toggle turns it off");
         assert!(!bank.all_mode());
+    }
+
+    /// A bank with a distinct color per LED, so every shift is visible.
+    fn distinct_bank() -> LedBank {
+        LedBank::from_colors(std::array::from_fn(|i| Color::new((i + 1) as u8, 0, 0)))
+    }
+
+    /// The rotation starts off, travelling clockwise.
+    #[test]
+    fn rotation_starts_off_and_clockwise() {
+        let bank = LedBank::rainbow();
+        assert!(!bank.rotation_on(), "rotation is off by default");
+        assert_eq!(
+            bank.rotation_direction(),
+            RotationDirection::Clockwise,
+            "clockwise is the default direction"
+        );
+    }
+
+    /// `toggle_rotation` flips the rotation, which starts off.
+    #[test]
+    fn toggle_rotation_flips_the_state() {
+        let mut bank = LedBank::rainbow();
+        assert!(bank.toggle_rotation(), "first toggle turns it on");
+        assert!(bank.rotation_on());
+        assert!(!bank.toggle_rotation(), "second toggle turns it off");
+        assert!(!bank.rotation_on());
+    }
+
+    /// `flip_direction` switches between clockwise and counter-clockwise.
+    #[test]
+    fn flip_direction_switches_directions() {
+        let mut bank = LedBank::rainbow();
+        assert_eq!(bank.rotation_direction(), RotationDirection::Clockwise);
+        bank.flip_direction();
+        assert_eq!(
+            bank.rotation_direction(),
+            RotationDirection::CounterClockwise
+        );
+        bank.flip_direction();
+        assert_eq!(bank.rotation_direction(), RotationDirection::Clockwise);
+    }
+
+    /// Clockwise: LED 1's color lands on LED 8, LED 2's on LED 1, and so on
+    /// (each color moves to the previous LED's position).
+    #[test]
+    fn rotate_clockwise_moves_every_color_to_the_previous_position() {
+        let mut bank = distinct_bank();
+        bank.rotate();
+
+        let reds: Vec<u8> = bank.colors().iter().map(|c| c.r).collect();
+        assert_eq!(
+            reds,
+            vec![2, 3, 4, 5, 6, 7, 8, 1],
+            "each slot should hold the color of the LED one number up \
+             (LED 1's color wraps around to LED 8)"
+        );
+    }
+
+    /// Counter-clockwise: LED 1's color lands on LED 2, LED 2's on LED 3,
+    /// and so on (each color moves to the next LED's position).
+    #[test]
+    fn rotate_counter_clockwise_moves_every_color_to_the_next_position() {
+        let mut bank = distinct_bank();
+        bank.flip_direction();
+        bank.rotate();
+
+        let reds: Vec<u8> = bank.colors().iter().map(|c| c.r).collect();
+        assert_eq!(
+            reds,
+            vec![8, 1, 2, 3, 4, 5, 6, 7],
+            "each slot should hold the color of the LED one number down \
+             (LED 8's color wraps around to LED 1)"
+        );
+    }
+
+    /// Eight shifts (one full turn) bring every color back to where it
+    /// started, in both directions.
+    #[test]
+    fn full_turn_restores_the_starting_colors() {
+        for direction in [
+            RotationDirection::Clockwise,
+            RotationDirection::CounterClockwise,
+        ] {
+            let mut bank = distinct_bank();
+            if matches!(direction, RotationDirection::CounterClockwise) {
+                bank.flip_direction();
+            }
+            for _ in 0..LED_COUNT {
+                bank.rotate();
+            }
+            assert_eq!(
+                bank.colors(),
+                distinct_bank().colors(),
+                "a full turn in {direction:?} should be the identity"
+            );
+        }
     }
 
     /// `colors` returns one color per LED, in ring order.

@@ -13,6 +13,10 @@ number sits in its LED's wedge, drawn in the inverse of the wedge's color
 (e.g. a red wedge gets a cyan number) so it stays readable on any color.
 Select a LED with the `1` to `8` keys and adjust its color independently —
 each LED keeps its own color, written straight to the embedded controller (EC).
+Toggle `t` and the colors travel around the ring instead: every 1/8 of a
+second the color of LED 1 moves to position 8, the color of 8 to position 7,
+and so on (one full turn per second); `s` flips the direction between
+clockwise and counter-clockwise.
 
 On start the app restores the colors it set last time, so it never overwrites
 a lit fan (the EC cannot report the current colors, so the app keeps them in
@@ -41,6 +45,11 @@ sudo ./target/release/framework_desktop_tui
 | `r` / `R`  | increase / decrease red                            |
 | `g` / `G`  | increase / decrease green                          |
 | `b` / `B`  | increase / decrease blue                           |
+| `t`        | toggle the rotation: while on, the colors shift one|
+|            | position around the ring every 1/8 s (one full     |
+|            | turn per second)                                   |
+| `s`        | flip the rotation direction (clockwise /           |
+|            | counter-clockwise)                                 |
 | `q`/`Esc`  | quit                                               |
 
 If the fan cannot be reached (no hardware, not root), the error is shown in

@@ -15,6 +15,9 @@
 //! - `r` / `R` — increase / decrease red (selected LED, or all when toggled)
 //! - `g` / `G` — increase / decrease green
 //! - `b` / `B` — increase / decrease blue
+//! - `t` — toggle the rotation: while on, the colors shift one position
+//!   around the ring every 1/8 s (LED 1's color moves to LED 8, and so on)
+//! - `s` — flip the rotation direction (clockwise ↔ counter-clockwise)
 //! - `q` or `Esc` — quit
 //!
 //! On start the app restores the colors it set last time, so it never
@@ -23,7 +26,7 @@
 //! a state file (see [`crate::state`]).
 
 use std::io::{self, Stdout};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::cursor;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -41,11 +44,15 @@ use ratatui::widgets::canvas::{Canvas, Circle, Context, Points};
 use ratatui::widgets::Paragraph;
 
 use crate::fan::{Color, FanController, LED_COUNT};
-use crate::led::{Channel, LedBank, COLOR_STEP};
+use crate::led::{Channel, LedBank, RotationDirection, COLOR_STEP};
 use crate::state;
 
 /// How long the event loop waits for input before redrawing.
 const POLL_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// How often the colors shift around the ring while rotating: one position
+/// per 1/8 s, so a full turn takes one second.
+const ROTATION_INTERVAL: Duration = Duration::from_millis(125);
 
 /// Radius of the fan ring in canvas units.
 const RING_RADIUS: f64 = 10.0;
@@ -125,6 +132,17 @@ impl App {
             }
             KeyCode::Char('a') => {
                 self.leds.toggle_all();
+                return true;
+            }
+            // Rotation only changes which colors the event loop will shift on
+            // its next 1/8 s tick (or where they will go); neither changes
+            // the fan right now, so no write is needed.
+            KeyCode::Char('t') => {
+                self.leds.toggle_rotation();
+                return true;
+            }
+            KeyCode::Char('s') => {
+                self.leds.flip_direction();
                 return true;
             }
             KeyCode::Char('r') => self.leds.nudge(Channel::Red, COLOR_STEP),
@@ -226,6 +244,10 @@ pub fn run<F: FanController>(fan: &F) -> Result<(), Box<dyn std::error::Error>> 
 }
 
 /// The main loop: draw a frame, then wait for input.
+///
+/// While the color ring is rotating, the loop also shifts the colors one
+/// position every [`ROTATION_INTERVAL`] (1/8 s) and writes the fan, so the
+/// colors travel around the ring at one position per tick.
 fn run_loop<F: FanController>(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     fan: &F,
@@ -238,17 +260,56 @@ fn run_loop<F: FanController>(
         app.persist();
     }
 
+    // While the ring is rotating: the time of the next color shift. Each
+    // shift counts from the previous deadline (not from "now"), so the 1/8 s
+    // cadence does not drift with frame times. `None` while rotation is off.
+    let mut next_shift: Option<Instant> = None;
+
     loop {
+        // Shift the colors once the ring's deadline has come.
+        let now = Instant::now();
+        if let Some(deadline) = next_shift
+            && app.leds.rotation_on()
+            && now >= deadline
+        {
+            app.leds.rotate();
+            app.apply(fan);
+            app.persist();
+            let mut next = deadline + ROTATION_INTERVAL;
+            // Skip past any intervals that are already in the past (e.g.
+            // after a long sleep) without shifting once per missed tick.
+            while next <= now {
+                next += ROTATION_INTERVAL;
+            }
+            next_shift = Some(next);
+        }
+
         terminal.draw(|frame| draw(frame, &app))?;
-        // Wait for input; if nothing is pending, just redraw on the next tick.
-        if !event::poll(POLL_TIMEOUT)? {
+
+        // Wait for input or for the next rotation shift, whichever comes
+        // first; if nothing is pending, just redraw on the next tick.
+        let wait = match next_shift {
+            Some(deadline) if app.leds.rotation_on() => {
+                deadline.saturating_duration_since(Instant::now())
+            }
+            _ => POLL_TIMEOUT,
+        };
+        if !event::poll(wait)? {
             continue;
         }
         if let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
-            && !app.handle_key(key.code, fan)
         {
-            break;
+            let was_rotating = app.leds.rotation_on();
+            if !app.handle_key(key.code, fan) {
+                break;
+            }
+            let is_rotating = app.leds.rotation_on();
+            if was_rotating != is_rotating {
+                // The first shift happens 1/8 s after the toggle (or ticking
+                // stops altogether when the rotation is switched off).
+                next_shift = is_rotating.then(|| Instant::now() + ROTATION_INTERVAL);
+            }
         }
     }
     Ok(())
@@ -376,17 +437,30 @@ fn title(app: &App) -> Paragraph<'static> {
 fn footer(app: &App) -> Paragraph<'static> {
     let hint = Line::from(vec![
         Span::styled(" 1-8 ", Style::default().fg(RColor::Cyan)),
-        Span::raw("select LED   "),
+        Span::raw("select   "),
         Span::styled(" a ", Style::default().fg(RColor::Cyan)),
-        Span::raw("all LEDs   "),
+        Span::raw("all   "),
         Span::styled(" r/R g/G b/B ", Style::default().fg(RColor::Cyan)),
         Span::raw("adjust   "),
-        Span::styled("q / Esc ", Style::default().fg(RColor::Cyan)),
+        Span::styled(" t ", Style::default().fg(RColor::Cyan)),
+        Span::raw("rotate   "),
+        Span::styled(" s ", Style::default().fg(RColor::Cyan)),
+        Span::raw("CW/CCW   "),
+        Span::styled("q/Esc ", Style::default().fg(RColor::Cyan)),
         Span::raw("quit"),
     ]);
+    // The rotation state: off, or the direction the colors travel.
+    let rotation = if app.leds.rotation_on() {
+        match app.leds.rotation_direction() {
+            RotationDirection::Clockwise => "clockwise",
+            RotationDirection::CounterClockwise => "counter-clockwise",
+        }
+    } else {
+        "off"
+    };
     let status = match &app.error {
         Some(err) => Line::from(Span::styled(
-            format!("fan error: {err}"),
+            format!("fan error: {err}   rotation: {rotation}"),
             Style::default().fg(RColor::Red),
         )),
         None => {
@@ -394,12 +468,12 @@ fn footer(app: &App) -> Paragraph<'static> {
             let color = selected.color();
             let status = if app.leds.all_mode() {
                 format!(
-                    "fan: {LED_COUNT} LEDs, ALL LEDs  RGB({:3}, {:3}, {:3})",
+                    "fan: {LED_COUNT} LEDs, ALL LEDs  RGB({:3}, {:3}, {:3})   rotation: {rotation}",
                     color.r, color.g, color.b
                 )
             } else {
                 format!(
-                    "fan: {LED_COUNT} LEDs, LED {} selected  RGB({:3}, {:3}, {:3})",
+                    "fan: {LED_COUNT} LEDs, LED {} selected  RGB({:3}, {:3}, {:3})   rotation: {rotation}",
                     selected.number(),
                     color.r,
                     color.g,
@@ -666,5 +740,75 @@ mod tests {
         let (no_state, write_on_start) = App::from_state(None);
         assert!(write_on_start, "no state file means an all-off fan");
         assert_eq!(no_state.leds.colors(), LedBank::rainbow().colors());
+    }
+
+    /// A fan that records how many times it was written.
+    #[derive(Default)]
+    struct CountingFan {
+        writes: std::cell::Cell<usize>,
+    }
+
+    impl FanController for CountingFan {
+        fn write(&self, _colors: &[Color]) -> Result<(), crate::fan::FanError> {
+            self.writes.set(self.writes.get() + 1);
+            Ok(())
+        }
+    }
+
+    /// `t` toggles the rotation and `s` flips its direction, and neither
+    /// writes the fan (the rotation ticks do that instead).
+    #[test]
+    fn t_and_s_control_the_rotation_without_a_write() {
+        let fan = CountingFan::default();
+        let mut app = App {
+            leds: red_bank(),
+            error: None,
+        };
+
+        assert!(!app.leds.rotation_on(), "rotation starts off");
+        assert!(
+            app.handle_key(KeyCode::Char('t'), &fan),
+            "t keeps the app running"
+        );
+        assert!(app.leds.rotation_on(), "t turns the rotation on");
+        assert_eq!(
+            app.leds.rotation_direction(),
+            RotationDirection::Clockwise,
+            "the rotation starts clockwise"
+        );
+
+        assert!(app.handle_key(KeyCode::Char('s'), &fan), "s keeps the app running");
+        assert_eq!(
+            app.leds.rotation_direction(),
+            RotationDirection::CounterClockwise,
+            "s flips the direction"
+        );
+
+        assert!(app.handle_key(KeyCode::Char('t'), &fan));
+        assert!(!app.leds.rotation_on(), "t turns the rotation off again");
+
+        assert_eq!(fan.writes.get(), 0, "t and s must not write the fan");
+    }
+
+    /// While rotating, one shift per direction moves the colors exactly as
+    /// the rotation promises: clockwise sends LED 1's color to LED 8.
+    #[test]
+    fn rotating_tui_shows_the_shifted_colors() {
+        let fan = CountingFan::default();
+        let mut app = App {
+            leds: LedBank::from_colors(std::array::from_fn(|i| {
+                Color::new((i + 1) as u8, 0, 0)
+            })),
+            error: None,
+        };
+        app.leds.toggle_rotation();
+        app.leds.rotate(); // one tick, as the event loop performs it
+        app.apply(&fan);
+        app.persist();
+
+        assert_eq!(fan.writes.get(), 1, "the rotation tick writes the fan");
+        let colors = app.leds.colors();
+        assert_eq!(colors[7], Color::new(1, 0, 0), "LED 1's color lands on LED 8");
+        assert_eq!(colors[0], Color::new(2, 0, 0), "LED 2's color lands on LED 1");
     }
 }
