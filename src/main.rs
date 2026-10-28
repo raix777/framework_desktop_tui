@@ -1,8 +1,9 @@
 //! Interactive TUI for the Framework Desktop fan LEDs.
 //!
-//! The fan is shown as a circle with one point per LED; every point lights up
-//! in the color of the physical LED it represents. Adjust the color with the
-//! `r`/`R`, `g`/`G` and `b`/`B` keys, and press `q` to quit.
+//! The fan is shown as a circle with one point per LED; each point lights up
+//! in the color of the physical LED it represents. Pick a LED (numbered 1 to
+//! 8) with the `1` to `8` keys and adjust its color with the `r`/`R`, `g`/`G`
+//! and `b`/`B` keys; press `a` to adjust every LED at once, and `q` to quit.
 //!
 //! Requires root and a Framework Desktop:
 //!
@@ -12,6 +13,7 @@
 
 mod fan;
 mod framework_fan;
+mod led;
 mod tui;
 
 use framework_fan::FrameworkFan;

@@ -6,9 +6,10 @@ the [framework-system] library.
 ## What it does
 
 The fan is drawn as a circle in the middle of the screen. One point on the
-circumference represents each of the 8 fan LEDs, and every point lights up in
-the same color as the physical LED it represents — all LEDs share a single
-color that is written straight to the embedded controller (EC).
+circumference represents each of the 8 fan LEDs (numbered 1 to 8), and every
+point lights up in the same color as the physical LED it represents. Select a
+LED with the `1` to `8` keys and adjust its color independently — each LED
+keeps its own color, written straight to the embedded controller (EC).
 
 ## Requirements
 
@@ -24,12 +25,15 @@ sudo ./target/release/framework_desktop_tui
 
 ## Controls
 
-| Key        | Action                    |
-| ---------- | ------------------------- |
-| `r` / `R`  | increase / decrease red   |
-| `g` / `G`  | increase / decrease green |
-| `b` / `B`  | increase / decrease blue  |
-| `q`/`Esc`  | quit                      |
+| Key        | Action                                             |
+| ---------- | -------------------------------------------------- |
+| `1`-`8`    | select the LED to adjust                           |
+| `a`        | toggle "all LEDs" mode (off by default): when on,  |
+|            | the color keys below adjust every LED at once      |
+| `r` / `R`  | increase / decrease red                            |
+| `g` / `G`  | increase / decrease green                          |
+| `b` / `B`  | increase / decrease blue                           |
+| `q`/`Esc`  | quit                                               |
 
 If the fan cannot be reached (no hardware, not root), the error is shown in
 the footer and the TUI stays interactive.

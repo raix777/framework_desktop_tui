@@ -2,11 +2,14 @@
 //!
 //! The fan is drawn as a circle in the middle of the screen. One point on the
 //! circumference represents each of the [`LED_COUNT`] fan LEDs, and every point
-//! lights up in the same color as the physical LED it represents (all LEDs share
-//! a single color, written with [`FanController::set_all`]).
+//! lights up in the color of the physical LED it represents. The LEDs are
+//! numbered **1 to 8**.
 //!
 //! Keys:
-//! - `r` / `R` — increase / decrease red
+//! - `1`..`8` — select the LED to adjust (no fan write needed)
+//! - `a` — toggle "all LEDs" mode: when on, color keys adjust every LED at
+//!   once (off by default)
+//! - `r` / `R` — increase / decrease red (selected LED, or all when toggled)
 //! - `g` / `G` — increase / decrease green
 //! - `b` / `B` — increase / decrease blue
 //! - `q` or `Esc` — quit
@@ -30,6 +33,7 @@ use ratatui::widgets::canvas::{Canvas, Circle, Points};
 use ratatui::widgets::Paragraph;
 
 use crate::fan::{Color, FanController, LED_COUNT};
+use crate::led::{Channel, LedBank, COLOR_STEP};
 
 /// How long the event loop waits for input before redrawing.
 const POLL_TIMEOUT: Duration = Duration::from_millis(100);
@@ -44,42 +48,52 @@ const LABEL_RADIUS: f64 = RING_RADIUS - 2.5;
 /// Half-extent of the canvas viewport: both axes span `[-VIEW, VIEW]`.
 const VIEW: f64 = 12.0;
 
-/// Step applied to a color channel per key press.
-const COLOR_STEP: i16 = 16;
+/// Radius of the small white ring drawn around the selected LED.
+const SELECT_RADIUS: f64 = 1.0;
 
 /// State of the TUI.
 #[derive(Debug)]
 struct App {
-    /// Color currently applied to all LEDs (they share a single color).
-    color: Color,
+    /// The per-LED colors and the currently selected LED.
+    leds: LedBank,
     /// Error from the last fan write, if any (shown in the footer).
     error: Option<String>,
 }
 
 impl App {
     fn new() -> Self {
-        // Start red, matching the original one-shot program.
+        // All LEDs start red, LED 1 selected (matching the original program).
         Self {
-            color: Color::new(255, 0, 0),
+            leds: LedBank::new(),
             error: None,
         }
     }
 
-    /// Push the current color to the fan, remembering any error for display.
+    /// Push the per-LED colors to the fan, remembering any error for display.
     fn apply<F: FanController>(&mut self, fan: &F) {
-        self.error = fan.set_all(self.color).err().map(|err| err.to_string());
+        self.error = fan.write(&self.leds.colors()).err().map(|err| err.to_string());
     }
 
     /// Handle a key press. Returns `false` when the app should quit.
     fn handle_key<F: FanController>(&mut self, code: KeyCode, fan: &F) -> bool {
         match code {
             KeyCode::Char('q') | KeyCode::Esc => return false,
-            KeyCode::Char('r') => nudge(&mut self.color.r, COLOR_STEP),
-            KeyCode::Char('R') => nudge(&mut self.color.r, -COLOR_STEP),
-            KeyCode::Char('g') => nudge(&mut self.color.g, COLOR_STEP),
-            KeyCode::Char('G') => nudge(&mut self.color.g, -COLOR_STEP),
-            KeyCode::Char('b') => nudge(&mut self.color.b, COLOR_STEP),
-            KeyCode::Char('B') => nudge(&mut self.color.b, -COLOR_STEP),
+            // Selecting a LED or toggling all-mode only changes the target of
+            // future color keys; neither changes the fan, so no write is needed.
+            KeyCode::Char(c @ '1'..='8') => {
+                self.leds.select_key(c);
+                return true;
+            }
+            KeyCode::Char('a') => {
+                self.leds.toggle_all();
+                return true;
+            }
+            KeyCode::Char('r') => self.leds.nudge(Channel::Red, COLOR_STEP),
+            KeyCode::Char('R') => self.leds.nudge(Channel::Red, -COLOR_STEP),
+            KeyCode::Char('g') => self.leds.nudge(Channel::Green, COLOR_STEP),
+            KeyCode::Char('G') => self.leds.nudge(Channel::Green, -COLOR_STEP),
+            KeyCode::Char('b') => self.leds.nudge(Channel::Blue, COLOR_STEP),
+            KeyCode::Char('B') => self.leds.nudge(Channel::Blue, -COLOR_STEP),
             _ => return true,
         }
         self.apply(fan);
@@ -87,16 +101,11 @@ impl App {
     }
 }
 
-/// Add `step` to a color channel, clamping the result to `0..=255`.
-fn nudge(channel: &mut u8, step: i16) {
-    let value = (*channel as i16 + step).clamp(0, 255);
-    *channel = value as u8;
-}
-
-/// Angle (radians) of LED `i` on the ring.
+/// Angle (radians) of the LED at ring position `i` (0-based).
 ///
-/// LED 0 sits at the top (12 o'clock) and the rest run counter-clockwise, so
-/// the positions read like the numbers around a clock face.
+/// Position 0 (LED 1) sits at the top (12 o'clock) and the rest run
+/// counter-clockwise, so the positions read like the numbers around a clock
+/// face.
 fn led_angle(i: usize) -> f64 {
     std::f64::consts::FRAC_PI_2 + (i as f64) * 2.0 * std::f64::consts::PI / LED_COUNT as f64
 }
@@ -167,7 +176,9 @@ fn draw(frame: &mut Frame, app: &App) {
     frame.render_widget(footer(app), chunks[2]);
 }
 
-/// Draw the fan: a dim ring with one lit point per LED.
+/// Draw the fan: a dim ring with one lit point per LED, each in its own color.
+///
+/// The selected LED is highlighted with a small white ring and a bold label.
 fn draw_ring(frame: &mut Frame, app: &App, area: Rect) {
     // Terminal cells are about twice as tall as they are wide, so give the
     // canvas twice as many columns as rows to make the circle look round.
@@ -177,7 +188,8 @@ fn draw_ring(frame: &mut Frame, app: &App, area: Rect) {
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let canvas_area = Rect::new(x, y, width, height);
 
-    let led_color = to_ratatui_color(app.color);
+    let selected_index = app.leds.selected_index();
+    let all_mode = app.leds.all_mode();
     let canvas = Canvas::default()
         .marker(Marker::Dot)
         .x_bounds([-VIEW, VIEW])
@@ -191,25 +203,44 @@ fn draw_ring(frame: &mut Frame, app: &App, area: Rect) {
                 color: RColor::DarkGray,
             });
 
-            // One point per LED; all share the current color.
-            let coords: Vec<(f64, f64)> = (0..LED_COUNT)
-                .map(|i| point_at_radius(RING_RADIUS, led_angle(i)))
-                .collect();
-            ctx.draw(&Points {
-                coords: &coords,
-                color: led_color,
-            });
+            // A small white ring around the selected LED, in single-LED mode
+            // only (in all-mode every LED is active, so none is singled out).
+            // Drawn before the LED points so the selected LED's own dot is
+            // painted on top of it.
+            if !all_mode {
+                let (sx, sy) = point_at_radius(RING_RADIUS, led_angle(selected_index));
+                ctx.draw(&Circle {
+                    x: sx,
+                    y: sy,
+                    radius: SELECT_RADIUS,
+                    color: RColor::White,
+                });
+            }
 
-            // Number each LED just inside the ring.
-            for i in 0..LED_COUNT {
-                let (lx, ly) = point_at_radius(LABEL_RADIUS, led_angle(i));
+            // One point per LED, each in its own color.
+            for (index, led) in app.leds.indexed() {
+                let (px, py) = point_at_radius(RING_RADIUS, led_angle(index));
+                ctx.draw(&Points {
+                    coords: &[(px, py)],
+                    color: to_ratatui_color(led.color()),
+                });
+            }
+
+            // Number each LED (1..=LED_COUNT) just inside the ring. The
+            // selected LED's label is bold in single-LED mode.
+            for (index, led) in app.leds.indexed() {
+                let (lx, ly) = point_at_radius(LABEL_RADIUS, led_angle(index));
+                let style = if !all_mode && index == selected_index {
+                    Style::default()
+                        .fg(RColor::White)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(RColor::Gray)
+                };
                 ctx.print(
                     lx,
                     ly,
-                    Line::from(Span::styled(
-                        i.to_string(),
-                        Style::default().fg(RColor::Gray),
-                    )),
+                    Line::from(Span::styled(led.number().to_string(), style)),
                 );
             }
         });
@@ -217,16 +248,24 @@ fn draw_ring(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(canvas, canvas_area);
 }
 
-/// Title bar: app name plus the current color.
+/// Title bar: app name, the active target (a LED, or all of them), and its
+/// color.
 fn title(app: &App) -> Paragraph<'static> {
+    let selected = app.leds.selected();
+    let color = selected.color();
+    let target = if app.leds.all_mode() {
+        "ALL".to_string()
+    } else {
+        format!("LED {}", selected.number())
+    };
     Paragraph::new(Line::from(vec![
         Span::styled(
             " Framework Desktop Fan ",
             Style::default().add_modifier(Modifier::BOLD),
         ),
         Span::raw(format!(
-            "RGB({:3}, {:3}, {:3})",
-            app.color.r, app.color.g, app.color.b
+            " {target}  RGB({:3}, {:3}, {:3})",
+            color.r, color.g, color.b
         )),
     ]))
 }
@@ -234,8 +273,12 @@ fn title(app: &App) -> Paragraph<'static> {
 /// Footer: key hints on the first line, fan status on the second.
 fn footer(app: &App) -> Paragraph<'static> {
     let hint = Line::from(vec![
+        Span::styled(" 1-8 ", Style::default().fg(RColor::Cyan)),
+        Span::raw("select LED   "),
+        Span::styled(" a ", Style::default().fg(RColor::Cyan)),
+        Span::raw("all LEDs   "),
         Span::styled(" r/R g/G b/B ", Style::default().fg(RColor::Cyan)),
-        Span::raw("adjust color     "),
+        Span::raw("adjust   "),
         Span::styled("q / Esc ", Style::default().fg(RColor::Cyan)),
         Span::raw("quit"),
     ]);
@@ -244,13 +287,25 @@ fn footer(app: &App) -> Paragraph<'static> {
             format!("fan error: {err}"),
             Style::default().fg(RColor::Red),
         )),
-        None => Line::from(Span::styled(
-            format!(
-                "fan: {LED_COUNT} LEDs lit RGB({:3}, {:3}, {:3})",
-                app.color.r, app.color.g, app.color.b
-            ),
-            Style::default().fg(RColor::Green),
-        )),
+        None => {
+            let selected = app.leds.selected();
+            let color = selected.color();
+            let status = if app.leds.all_mode() {
+                format!(
+                    "fan: {LED_COUNT} LEDs, ALL LEDs  RGB({:3}, {:3}, {:3})",
+                    color.r, color.g, color.b
+                )
+            } else {
+                format!(
+                    "fan: {LED_COUNT} LEDs, LED {} selected  RGB({:3}, {:3}, {:3})",
+                    selected.number(),
+                    color.r,
+                    color.g,
+                    color.b
+                )
+            };
+            Line::from(Span::styled(status, Style::default().fg(RColor::Green)))
+        }
     };
     Paragraph::new(vec![hint, status])
 }
@@ -285,32 +340,15 @@ mod tests {
         }
     }
 
-    /// LED 0 is at the top of the ring (12 o'clock).
+    /// Position 0 (LED 1) is at the top of the ring (12 o'clock).
     #[test]
-    fn led_zero_is_at_the_top() {
+    fn led_one_is_at_the_top() {
         let (x, y) = point_at_radius(RING_RADIUS, led_angle(0));
         assert!(
             x.abs() < 1e-9,
-            "LED 0 should be centered horizontally, got x={x}"
+            "LED 1 should be centered horizontally, got x={x}"
         );
-        assert!(y > 0.0, "LED 0 should be at the top, got y={y}");
-    }
-
-    /// `nudge` moves a channel and clamps it to the byte range.
-    #[test]
-    fn nudge_moves_and_clamps_channels() {
-        let mut channel = 100u8;
-        nudge(&mut channel, COLOR_STEP);
-        assert_eq!(channel, 116);
-        nudge(&mut channel, -COLOR_STEP * 2);
-        assert_eq!(channel, 84);
-
-        let mut low = 0u8;
-        nudge(&mut low, -COLOR_STEP);
-        assert_eq!(low, 0);
-        let mut high = 255u8;
-        nudge(&mut high, COLOR_STEP);
-        assert_eq!(high, 255);
+        assert!(y > 0.0, "LED 1 should be at the top, got y={y}");
     }
 
     /// The domain color maps to a truecolor RGB.
@@ -326,7 +364,7 @@ mod tests {
     #[test]
     fn frame_renders_a_lit_point_per_led() {
         let app = App {
-            color: Color::new(255, 0, 0),
+            leds: LedBank::new(),
             error: None,
         };
         let mut terminal = Terminal::new(TestBackend::new(80, 24))
@@ -347,5 +385,75 @@ mod tests {
             count >= LED_COUNT,
             "expected >= {LED_COUNT} lit cells, found {count}"
         );
+    }
+
+    /// Each LED renders in its own color when the colors differ.
+    #[test]
+    fn frame_renders_each_led_in_its_own_color() {
+        let mut leds = LedBank::new();
+        // Turn LED 2 from red to blue; LED 1 stays red (all-mode is off).
+        leds.select(2);
+        leds.nudge(Channel::Red, -255);
+        leds.nudge(Channel::Blue, 255);
+
+        let app = App { leds, error: None };
+        let mut terminal = Terminal::new(TestBackend::new(80, 24))
+            .expect("test backend should initialize");
+        terminal
+            .draw(|frame| draw(frame, &app))
+            .expect("draw should not fail");
+
+        let content = terminal.backend_mut().buffer().content();
+        let red = RColor::Rgb(255, 0, 0);
+        let blue = RColor::Rgb(0, 0, 255);
+        let reds = content.iter().filter(|cell| cell.fg == red).count();
+        let blues = content.iter().filter(|cell| cell.fg == blue).count();
+        assert!(reds >= 1, "LED 1 should stay red, found {reds}");
+        assert!(blues >= 1, "LED 2 should be blue, found {blues}");
+    }
+
+    /// The selected LED's label is drawn bold (and white), unlike the plain
+    /// gray labels of the other LEDs.
+    #[test]
+    fn frame_highlights_the_selected_led() {
+        let mut leds = LedBank::new();
+        leds.select(8);
+
+        let app = App { leds, error: None };
+        let mut terminal = Terminal::new(TestBackend::new(80, 24))
+            .expect("test backend should initialize");
+        terminal
+            .draw(|frame| draw(frame, &app))
+            .expect("draw should not fail");
+
+        let content = terminal.backend_mut().buffer().content();
+        let highlighted = content
+            .iter()
+            .any(|cell| cell.fg == RColor::White && cell.modifier.contains(Modifier::BOLD));
+        assert!(
+            highlighted,
+            "expected a bold white cell for the selected LED"
+        );
+    }
+
+    /// In all-mode no single LED is highlighted (no bold white label, no ring).
+    #[test]
+    fn frame_shows_no_single_highlight_in_all_mode() {
+        let mut leds = LedBank::new();
+        leds.toggle_all();
+        assert!(leds.all_mode());
+
+        let app = App { leds, error: None };
+        let mut terminal = Terminal::new(TestBackend::new(80, 24))
+            .expect("test backend should initialize");
+        terminal
+            .draw(|frame| draw(frame, &app))
+            .expect("draw should not fail");
+
+        let content = terminal.backend_mut().buffer().content();
+        let highlighted = content
+            .iter()
+            .any(|cell| cell.fg == RColor::White && cell.modifier.contains(Modifier::BOLD));
+        assert!(!highlighted, "all-mode should not highlight a single LED");
     }
 }

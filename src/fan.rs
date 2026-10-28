@@ -52,11 +52,6 @@ pub trait FanController {
     ///
     /// `colors.len()` must equal [`LED_COUNT`].
     fn write(&self, colors: &[Color]) -> Result<(), FanError>;
-
-    /// Sets every LED to the same color.
-    fn set_all(&self, color: Color) -> Result<(), FanError> {
-        self.write(&[color; LED_COUNT])
-    }
 }
 
 #[cfg(test)]
@@ -83,19 +78,31 @@ mod tests {
         }
     }
 
+    /// `write` accepts exactly [`LED_COUNT`] colors and records them.
     #[test]
-    fn set_all_writes_the_color_to_every_led() {
+    fn write_records_all_led_colors() {
         let fan = RecordingFan::default();
-        let red = Color::new(255, 0, 0);
+        let colors = vec![Color::new(1, 2, 3); LED_COUNT];
 
-        fan.set_all(red).expect("set_all should succeed");
+        fan.write(&colors).expect("write should succeed");
 
         let writes = fan.writes.borrow();
-        assert_eq!(writes.len(), 1, "set_all should perform exactly one write");
-        assert_eq!(
-            writes[0],
-            vec![red; LED_COUNT],
-            "every LED must receive the given color"
-        );
+        assert_eq!(writes.len(), 1, "write should perform exactly one write");
+        assert_eq!(writes[0], colors, "the written colors must be recorded");
+    }
+
+    /// `write` rejects a color slice with a length different from [`LED_COUNT`].
+    #[test]
+    fn write_rejects_the_wrong_led_count() {
+        let fan = RecordingFan::default();
+
+        let err = fan.write(&[Color::new(255, 0, 0)]).unwrap_err();
+        match err {
+            FanError::WrongLedCount { expected, actual } => {
+                assert_eq!(expected, LED_COUNT);
+                assert_eq!(actual, 1);
+            }
+            other => panic!("expected WrongLedCount, got {other:?}"),
+        }
     }
 }
