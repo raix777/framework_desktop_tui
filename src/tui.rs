@@ -16,6 +16,11 @@
 //! - `g` / `G` — increase / decrease green
 //! - `b` / `B` — increase / decrease blue
 //! - `q` or `Esc` — quit
+//!
+//! On start the app restores the colors it set last time, so it never
+//! overwrites a lit fan; when every LED is off it lights the fan with a
+//! rainbow. The EC cannot report the current colors, so the app keeps them in
+//! a state file (see [`crate::state`]).
 
 use std::io::{self, Stdout};
 use std::time::Duration;
@@ -37,6 +42,7 @@ use ratatui::widgets::Paragraph;
 
 use crate::fan::{Color, FanController, LED_COUNT};
 use crate::led::{Channel, LedBank, COLOR_STEP};
+use crate::state;
 
 /// How long the event loop waits for input before redrawing.
 const POLL_TIMEOUT: Duration = Duration::from_millis(100);
@@ -64,17 +70,47 @@ struct App {
 }
 
 impl App {
-    fn new() -> Self {
-        // All LEDs start red, LED 1 selected (matching the original program).
-        Self {
-            leds: LedBank::new(),
-            error: None,
+    /// Build the app from the colors the app set last time, if any.
+    ///
+    /// `loaded` is the state file's colors (see [`state`]): when at least one
+    /// LED is lit, those colors are restored and the fan is left alone (it
+    /// already shows them); otherwise (no state, or every LED black) the app
+    /// starts with a rainbow.
+    ///
+    /// Returns the app and whether the fan must be written at startup: a
+    /// restored fan is already lit, a fresh rainbow is not.
+    fn from_state(loaded: Option<[Color; LED_COUNT]>) -> (Self, bool) {
+        // No state file: the fan is assumed to be off, so light it with a
+        // fresh rainbow.
+        let Some(colors) = loaded else {
+            return (Self { leds: LedBank::rainbow(), error: None }, true);
+        };
+        // A saved state with at least one lit LED is the fan's current state:
+        // restore it and leave the fan alone. Every LED black means the fan
+        // is off, so fall back to the rainbow as well.
+        let leds = LedBank::from_colors(colors);
+        if leds.any_lit() {
+            (Self { leds, error: None }, false)
+        } else {
+            (Self { leds: LedBank::rainbow(), error: None }, true)
         }
+    }
+
+    /// Build the app for a fresh run, loading the saved colors first.
+    fn startup() -> (Self, bool) {
+        Self::from_state(state::load())
     }
 
     /// Push the per-LED colors to the fan, remembering any error for display.
     fn apply<F: FanController>(&mut self, fan: &F) {
         self.error = fan.write(&self.leds.colors()).err().map(|err| err.to_string());
+    }
+
+    /// Save the current colors so the next run restores them instead of
+    /// assuming the fan is off. Best-effort: the EC cannot report the colors
+    /// back, so without this the app could not tell a lit fan from an off one.
+    fn persist(&self) {
+        let _ = state::save(&self.leds.colors());
     }
 
     /// Handle a key press. Returns `false` when the app should quit.
@@ -100,6 +136,7 @@ impl App {
             _ => return true,
         }
         self.apply(fan);
+        self.persist();
         true
     }
 }
@@ -193,8 +230,13 @@ fn run_loop<F: FanController>(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     fan: &F,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut app = App::new();
-    app.apply(fan); // light the fan in the initial color
+    // Restore the last colors (no fan write) or start a fresh rainbow (which
+    // must be written to light the LEDs).
+    let (mut app, write_on_start) = App::startup();
+    if write_on_start {
+        app.apply(fan);
+        app.persist();
+    }
 
     loop {
         terminal.draw(|frame| draw(frame, &app))?;
@@ -375,6 +417,11 @@ mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
 
+    /// A bank with every LED red, as the frame tests below assume.
+    fn red_bank() -> LedBank {
+        LedBank::from_colors([Color::new(255, 0, 0); LED_COUNT])
+    }
+
     /// The 8 LED positions all sit on the ring and are well separated.
     #[test]
     fn led_positions_are_on_the_ring_and_distinct() {
@@ -424,7 +471,7 @@ mod tests {
     #[test]
     fn frame_renders_a_lit_point_per_led() {
         let app = App {
-            leds: LedBank::new(),
+            leds: red_bank(),
             error: None,
         };
         let mut terminal = Terminal::new(TestBackend::new(80, 24))
@@ -450,7 +497,7 @@ mod tests {
     /// Each LED renders in its own color when the colors differ.
     #[test]
     fn frame_renders_each_led_in_its_own_color() {
-        let mut leds = LedBank::new();
+        let mut leds = red_bank();
         // Turn LED 2 from red to blue; LED 1 stays red (all-mode is off).
         leds.select(2);
         leds.nudge(Channel::Red, -255);
@@ -477,7 +524,7 @@ mod tests {
     /// the other LEDs.
     #[test]
     fn frame_highlights_the_selected_led() {
-        let mut leds = LedBank::new();
+        let mut leds = red_bank();
         leds.select(8);
 
         let app = App { leds, error: None };
@@ -501,7 +548,7 @@ mod tests {
     /// In all-mode no single LED is highlighted (no bold number, no ring).
     #[test]
     fn frame_shows_no_single_highlight_in_all_mode() {
-        let mut leds = LedBank::new();
+        let mut leds = red_bank();
         leds.toggle_all();
         assert!(leds.all_mode());
 
@@ -525,7 +572,7 @@ mod tests {
     #[test]
     fn frame_fills_the_disc_with_the_wedge_colors() {
         let app = App {
-            leds: LedBank::new(),
+            leds: red_bank(),
             error: None,
         };
         let mut terminal = Terminal::new(TestBackend::new(80, 24))
@@ -548,7 +595,7 @@ mod tests {
     #[test]
     fn frame_numbers_are_inversed_to_their_area() {
         let app = App {
-            leds: LedBank::new(),
+            leds: red_bank(),
             error: None,
         };
         let mut terminal = Terminal::new(TestBackend::new(80, 24))
@@ -585,5 +632,39 @@ mod tests {
         // LED 7's.
         assert_eq!(led_wedge_at_angle(80.0f64.to_radians()), 0);
         assert_eq!(led_wedge_at_angle((-10.0f64).to_radians()), 6);
+    }
+
+    /// Startup restores the saved colors without writing the fan when at
+    /// least one LED is lit.
+    #[test]
+    fn from_state_restores_lit_colors_without_a_write() {
+        let colors = [Color::new(255, 0, 0); LED_COUNT];
+        let (app, write_on_start) = App::from_state(Some(colors));
+        assert!(!write_on_start, "restored colors are already on the fan");
+        assert_eq!(app.leds.colors(), colors.to_vec());
+    }
+
+    /// Startup keeps a mixed state (some LEDs off) as long as one is lit.
+    #[test]
+    fn from_state_keeps_a_mixed_state() {
+        let mut colors = [Color::BLACK; LED_COUNT];
+        colors[2] = Color::new(0, 255, 0);
+        let (app, write_on_start) = App::from_state(Some(colors));
+        assert!(!write_on_start);
+        assert_eq!(app.leds.colors(), colors.to_vec());
+    }
+
+    /// Startup falls back to a rainbow (which must be written) when every
+    /// LED is black or there is no state at all.
+    #[test]
+    fn from_state_falls_back_to_rainbow_when_all_off() {
+        let off = [Color::BLACK; LED_COUNT];
+        let (app, write_on_start) = App::from_state(Some(off));
+        assert!(write_on_start, "an all-off fan must be lit with the rainbow");
+        assert_eq!(app.leds.colors(), LedBank::rainbow().colors());
+
+        let (no_state, write_on_start) = App::from_state(None);
+        assert!(write_on_start, "no state file means an all-off fan");
+        assert_eq!(no_state.leds.colors(), LedBank::rainbow().colors());
     }
 }

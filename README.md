@@ -14,6 +14,11 @@ number sits in its LED's wedge, drawn in the inverse of the wedge's color
 Select a LED with the `1` to `8` keys and adjust its color independently —
 each LED keeps its own color, written straight to the embedded controller (EC).
 
+On start the app restores the colors it set last time, so it never overwrites
+a lit fan (the EC cannot report the current colors, so the app keeps them in
+`~/.local/state/framework_desktop_tui/leds.txt`). When every LED is off, it
+lights the fan with a rainbow instead of forcing a color.
+
 ## Requirements
 
 - A Framework Desktop

@@ -14,6 +14,7 @@
 mod fan;
 mod framework_fan;
 mod led;
+mod state;
 mod tui;
 
 use framework_fan::FrameworkFan;

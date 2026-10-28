@@ -83,22 +83,31 @@ pub struct LedBank {
     all_mode: bool,
 }
 
-impl Default for LedBank {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl LedBank {
-    /// Every LED starts red (matching the original one-shot program); LED 1 is
-    /// selected.
-    pub fn new() -> Self {
-        let leds = std::array::from_fn(|i| Led::new((i + 1) as u8, Color::new(255, 0, 0)));
+    /// Build a bank from explicit per-LED colors (in ring order); LED 1 is
+    /// selected and all-mode is off.
+    pub fn from_colors(colors: [Color; LED_COUNT]) -> Self {
+        let leds = std::array::from_fn(|i| Led::new((i + 1) as u8, colors[i]));
         Self {
             leds,
             selected: 0,
             all_mode: false,
         }
+    }
+
+    /// Build a bank with a rainbow: LED `i` shows hue `i · 360/LED_COUNT`, so
+    /// the 8 LEDs run around the color wheel starting at red (LED 1). LED 1
+    /// is selected and all-mode is off.
+    pub fn rainbow() -> Self {
+        let colors = std::array::from_fn(|i| {
+            Color::from_hue(360.0 * i as f64 / LED_COUNT as f64)
+        });
+        Self::from_colors(colors)
+    }
+
+    /// Whether at least one LED is lit (i.e. not [`Color::BLACK`]).
+    pub fn any_lit(&self) -> bool {
+        self.leds.iter().any(|led| led.color != Color::BLACK)
     }
 
     /// Whether all-mode is on (color changes apply to every LED).
@@ -180,10 +189,15 @@ impl LedBank {
 mod tests {
     use super::*;
 
+    /// A bank with every LED red, as the nudge/color tests below assume.
+    fn red_bank() -> LedBank {
+        LedBank::from_colors([Color::new(255, 0, 0); LED_COUNT])
+    }
+
     /// The LEDs are numbered 1..=LED_COUNT (i.e. 1 to 8), in ring order.
     #[test]
     fn leds_are_numbered_one_through_eight() {
-        let bank = LedBank::new();
+        let bank = LedBank::rainbow();
         let numbers: Vec<u8> = bank.indexed().map(|(_, led)| led.number()).collect();
         assert_eq!(numbers, (1..=LED_COUNT as u8).collect::<Vec<u8>>());
     }
@@ -191,7 +205,7 @@ mod tests {
     /// `select_key` maps `1`..`8` to the matching LED and rejects the rest.
     #[test]
     fn select_key_maps_digits_to_leds() {
-        let mut bank = LedBank::new();
+        let mut bank = LedBank::rainbow();
         for expected in 1..=LED_COUNT as u8 {
             let key = char::from_digit(expected as u32, 10).expect("digit");
             assert!(bank.select_key(key), "key {key} should select");
@@ -206,7 +220,7 @@ mod tests {
     /// `select` only accepts numbers in `1..=LED_COUNT`.
     #[test]
     fn select_rejects_out_of_range_numbers() {
-        let mut bank = LedBank::new();
+        let mut bank = LedBank::rainbow();
         assert!(!bank.select(0));
         assert!(!bank.select(9));
         assert!(bank.select(8));
@@ -217,7 +231,7 @@ mod tests {
     /// and clamps to 0..=255.
     #[test]
     fn nudge_affects_only_the_selected_led_by_default() {
-        let mut bank = LedBank::new();
+        let mut bank = red_bank();
         assert!(!bank.all_mode(), "all-mode is off by default");
         bank.select(2);
         bank.nudge(Channel::Green, COLOR_STEP);
@@ -240,7 +254,7 @@ mod tests {
     /// With all-mode on, `nudge` shifts every LED by the same step.
     #[test]
     fn nudge_affects_all_leds_in_all_mode() {
-        let mut bank = LedBank::new();
+        let mut bank = red_bank();
         bank.toggle_all();
         assert!(bank.all_mode());
         bank.nudge(Channel::Blue, COLOR_STEP);
@@ -257,7 +271,7 @@ mod tests {
     /// `toggle_all` flips all-mode, which starts off.
     #[test]
     fn toggle_all_flips_the_mode() {
-        let mut bank = LedBank::new();
+        let mut bank = LedBank::rainbow();
         assert!(!bank.all_mode(), "starts off");
         assert!(bank.toggle_all(), "first toggle turns it on");
         assert!(bank.all_mode());
@@ -268,7 +282,7 @@ mod tests {
     /// `colors` returns one color per LED, in ring order.
     #[test]
     fn colors_returns_one_per_led_in_order() {
-        let mut bank = LedBank::new();
+        let mut bank = red_bank();
         bank.select(3);
         bank.nudge(Channel::Blue, COLOR_STEP);
 
@@ -293,5 +307,58 @@ mod tests {
         assert_eq!(led.color().g, 0);
         led.nudge(Channel::Blue, -2 * COLOR_STEP); // 128 - 32 = 96 (in range, no clamp)
         assert_eq!(led.color().b, 96);
+    }
+
+    /// The rainbow spreads one hue per LED around the wheel: LED 1 starts at
+    /// red, no two LEDs share a color, and every LED is lit.
+    #[test]
+    fn rainbow_spreads_one_hue_per_led() {
+        let bank = LedBank::rainbow();
+        let colors = bank.colors();
+        assert_eq!(colors.len(), LED_COUNT);
+        assert_eq!(colors[0], Color::new(255, 0, 0), "LED 1 starts at red (hue 0)");
+        assert_eq!(
+            colors[LED_COUNT / 2],
+            Color::new(0, 255, 255),
+            "LED {half} is half a turn away (cyan)",
+            half = LED_COUNT / 2 + 1
+        );
+        for (i, a) in colors.iter().enumerate() {
+            for b in colors.iter().skip(i + 1) {
+                assert_ne!(a, b, "no two LEDs should share a hue");
+            }
+        }
+        assert!(bank.any_lit(), "a rainbow has every LED lit");
+    }
+
+    /// `from_colors` stores the given colors in ring order, selects LED 1 and
+    /// leaves all-mode off.
+    #[test]
+    fn from_colors_stores_every_led_in_order() {
+        let colors = [
+            Color::new(1, 2, 3),
+            Color::new(4, 5, 6),
+            Color::new(7, 8, 9),
+            Color::new(10, 11, 12),
+            Color::new(13, 14, 15),
+            Color::new(16, 17, 18),
+            Color::new(19, 20, 21),
+            Color::new(22, 23, 24),
+        ];
+        let bank = LedBank::from_colors(colors);
+        assert_eq!(bank.colors(), colors.to_vec());
+        assert_eq!(bank.selected().number(), 1);
+        assert!(!bank.all_mode());
+    }
+
+    /// `any_lit` is false only when every LED is black.
+    #[test]
+    fn any_lit_is_false_only_when_all_black() {
+        let all_off = LedBank::from_colors([Color::BLACK; LED_COUNT]);
+        assert!(!all_off.any_lit(), "all-black is off");
+
+        let mut one_lit = [Color::BLACK; LED_COUNT];
+        one_lit[3] = Color::new(1, 0, 0);
+        assert!(LedBank::from_colors(one_lit).any_lit(), "one lit LED is on");
     }
 }
