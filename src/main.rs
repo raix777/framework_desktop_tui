@@ -1,4 +1,8 @@
-//! Sets every RGB LED of the Framework Desktop fan to red.
+//! Interactive TUI for the Framework Desktop fan LEDs.
+//!
+//! The fan is shown as a circle with one point per LED; every point lights up
+//! in the color of the physical LED it represents. Adjust the color with the
+//! `r`/`R`, `g`/`G` and `b`/`B` keys, and press `q` to quit.
 //!
 //! Requires root and a Framework Desktop:
 //!
@@ -8,13 +12,11 @@
 
 mod fan;
 mod framework_fan;
+mod tui;
 
-use fan::{Color, FanController, LED_COUNT};
 use framework_fan::FrameworkFan;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let red = Color::new(255, 0, 0);
-    FrameworkFan.set_all(red)?;
-    println!("All {LED_COUNT} fan LEDs set to red (255, 0, 0)");
+    tui::run(&FrameworkFan)?;
     Ok(())
 }

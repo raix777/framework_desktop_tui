@@ -4,7 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+crossterm = "0.28.1"
 # Library crate of the FrameworkComputer/framework-system repo
 # (provides the EC access used by `framework_tool --rgbkbd ...`).
 # `default-features = false` skips the USB/HID modules we don't use.
 framework_lib = { version = "0.6.6", default-features = false }
+ratatui = "0.29.0"
