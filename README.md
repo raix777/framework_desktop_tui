@@ -5,11 +5,14 @@ the [framework-system] library.
 
 ## What it does
 
-The fan is drawn as a circle in the middle of the screen. One point on the
-circumference represents each of the 8 fan LEDs (numbered 1 to 8), and every
-point lights up in the same color as the physical LED it represents. Select a
-LED with the `1` to `8` keys and adjust its color independently — each LED
-keeps its own color, written straight to the embedded controller (EC).
+The fan is drawn as a filled circle in the middle of the screen: every dot
+inside the ring shows the color of the fan LED whose wedge (the 45° sector
+around that LED's spot on the ring) it falls in, and each of the 8 LEDs is
+marked by a lit point on the ring itself. The LEDs are numbered 1 to 8 — each
+number sits in its LED's wedge, drawn in the inverse of the wedge's color
+(e.g. a red wedge gets a cyan number) so it stays readable on any color.
+Select a LED with the `1` to `8` keys and adjust its color independently —
+each LED keeps its own color, written straight to the embedded controller (EC).
 
 ## Requirements
 

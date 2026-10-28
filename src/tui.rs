@@ -1,9 +1,12 @@
 //! Terminal user interface for the Framework Desktop fan.
 //!
-//! The fan is drawn as a circle in the middle of the screen. One point on the
-//! circumference represents each of the [`LED_COUNT`] fan LEDs, and every point
-//! lights up in the color of the physical LED it represents. The LEDs are
-//! numbered **1 to 8**.
+//! The fan is drawn as a filled circle in the middle of the screen: every dot
+//! inside the ring carries the color of the fan LED whose wedge (the 45°
+//! sector around that LED's position on the ring) it falls in, and each of the
+//! [`LED_COUNT`] LEDs is marked by a lit point on the ring itself. The LEDs
+//! are numbered **1 to 8**: each number sits in its LED's wedge, drawn in the
+//! inverse of the wedge's color (a red wedge gets a cyan number, and so on) so
+//! it stays readable on any color.
 //!
 //! Keys:
 //! - `1`..`8` — select the LED to adjust (no fan write needed)
@@ -29,7 +32,7 @@ use ratatui::style::{Color as RColor, Modifier, Style};
 use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
 use ratatui::{Frame, Terminal};
-use ratatui::widgets::canvas::{Canvas, Circle, Points};
+use ratatui::widgets::canvas::{Canvas, Circle, Context, Points};
 use ratatui::widgets::Paragraph;
 
 use crate::fan::{Color, FanController, LED_COUNT};
@@ -120,6 +123,55 @@ fn to_ratatui_color(color: Color) -> RColor {
     RColor::Rgb(color.r, color.g, color.b)
 }
 
+/// The 0-based index of the LED wedge that contains the point at `angle`
+/// (radians, y up).
+///
+/// Each LED owns the 45° sector centered on its own position on the ring, so
+/// the wedge index is the angle measured from the top (LED 1 at 12 o'clock),
+/// rounded to the nearest multiple of 45°.
+fn led_wedge_at_angle(angle: f64) -> usize {
+    let step = 2.0 * std::f64::consts::PI / LED_COUNT as f64;
+    let k = ((angle - std::f64::consts::FRAC_PI_2) / step).round() as i64;
+    let n = LED_COUNT as i64;
+    (((k % n) + n) % n) as usize
+}
+
+/// Fill the disc inside the fan ring with dots: one dot per canvas cell whose
+/// center lies inside the ring, each in the color of the LED wedge the cell
+/// falls in.
+///
+/// The cell centers are computed with the same mapping the ratatui canvas
+/// uses to turn a point into a grid cell, so every painted dot lands in the
+/// cell it was computed for.
+fn paint_disc(ctx: &mut Context, width: u16, height: u16, colors: &[Color]) {
+    debug_assert_eq!(colors.len(), LED_COUNT);
+    let cols = (f64::from(width) - 1.0).max(1.0);
+    let rows = (f64::from(height) - 1.0).max(1.0);
+    let mut wedge_points: [Vec<(f64, f64)>; LED_COUNT] = std::array::from_fn(|_| Vec::new());
+
+    for row in 0..height {
+        for col in 0..width {
+            // Domain position of this cell's center: the inverse of the
+            // canvas point-to-cell mapping for the `[-VIEW, VIEW]²` viewport.
+            let x = -VIEW + (f64::from(col) + 0.5) * 2.0 * VIEW / cols;
+            let y = VIEW - (f64::from(row) + 0.5) * 2.0 * VIEW / rows;
+            if x * x + y * y < RING_RADIUS * RING_RADIUS {
+                wedge_points[led_wedge_at_angle(y.atan2(x))].push((x, y));
+            }
+        }
+    }
+
+    for (index, points) in wedge_points.iter().enumerate() {
+        if points.is_empty() {
+            continue;
+        }
+        ctx.draw(&Points {
+            coords: points,
+            color: to_ratatui_color(colors[index]),
+        });
+    }
+}
+
 /// Run the TUI, setting up and restoring the terminal around the event loop.
 pub fn run<F: FanController>(fan: &F) -> Result<(), Box<dyn std::error::Error>> {
     let backend = CrosstermBackend::new(io::stdout());
@@ -176,9 +228,11 @@ fn draw(frame: &mut Frame, app: &App) {
     frame.render_widget(footer(app), chunks[2]);
 }
 
-/// Draw the fan: a dim ring with one lit point per LED, each in its own color.
+/// Draw the fan: a disc filled with dots in the per-LED wedge colors, a dim
+/// ring, one lit point per LED on the ring, and the LED numbers in their
+/// wedges — each number drawn in the inverse of its wedge's color.
 ///
-/// The selected LED is highlighted with a small white ring and a bold label.
+/// The selected LED is highlighted with a small white ring and a bold number.
 fn draw_ring(frame: &mut Frame, app: &App, area: Rect) {
     // Terminal cells are about twice as tall as they are wide, so give the
     // canvas twice as many columns as rows to make the circle look round.
@@ -190,11 +244,15 @@ fn draw_ring(frame: &mut Frame, app: &App, area: Rect) {
 
     let selected_index = app.leds.selected_index();
     let all_mode = app.leds.all_mode();
+    let colors = app.leds.colors();
     let canvas = Canvas::default()
         .marker(Marker::Dot)
         .x_bounds([-VIEW, VIEW])
         .y_bounds([-VIEW, VIEW])
         .paint(|ctx| {
+            // The filled disc, drawn first so everything else paints on top.
+            paint_disc(ctx, canvas_area.width, canvas_area.height, &colors);
+
             // The fan's outer ring, dim so the LEDs stand out.
             ctx.draw(&Circle {
                 x: 0.0,
@@ -226,16 +284,18 @@ fn draw_ring(frame: &mut Frame, app: &App, area: Rect) {
                 });
             }
 
-            // Number each LED (1..=LED_COUNT) just inside the ring. The
-            // selected LED's label is bold in single-LED mode.
+            // Number each LED (1..=LED_COUNT) just inside the ring. Each
+            // number sits in its LED's own wedge, so it is drawn in the
+            // inverse of that wedge's color (a red wedge gets a cyan number,
+            // and so on), keeping it readable on any color. The selected
+            // LED's number is bold in single-LED mode.
             for (index, led) in app.leds.indexed() {
                 let (lx, ly) = point_at_radius(LABEL_RADIUS, led_angle(index));
+                let fg = to_ratatui_color(led.color().inverse());
                 let style = if !all_mode && index == selected_index {
-                    Style::default()
-                        .fg(RColor::White)
-                        .add_modifier(Modifier::BOLD)
+                    Style::default().fg(fg).add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(RColor::Gray)
+                    Style::default().fg(fg)
                 };
                 ctx.print(
                     lx,
@@ -408,12 +468,13 @@ mod tests {
         let blue = RColor::Rgb(0, 0, 255);
         let reds = content.iter().filter(|cell| cell.fg == red).count();
         let blues = content.iter().filter(|cell| cell.fg == blue).count();
-        assert!(reds >= 1, "LED 1 should stay red, found {reds}");
-        assert!(blues >= 1, "LED 2 should be blue, found {blues}");
+        assert!(reds > 40, "most of the disc should stay red, found {reds}");
+        assert!(blues > 5, "LED 2's wedge should be filled blue, found {blues}");
     }
 
-    /// The selected LED's label is drawn bold (and white), unlike the plain
-    /// gray labels of the other LEDs.
+    /// The selected LED's number is drawn bold in the inverse of its wedge's
+    /// color (all LEDs red → bold cyan number), unlike the plain numbers of
+    /// the other LEDs.
     #[test]
     fn frame_highlights_the_selected_led() {
         let mut leds = LedBank::new();
@@ -427,16 +488,17 @@ mod tests {
             .expect("draw should not fail");
 
         let content = terminal.backend_mut().buffer().content();
+        let inverted = to_ratatui_color(app.leds.selected().color().inverse());
         let highlighted = content
             .iter()
-            .any(|cell| cell.fg == RColor::White && cell.modifier.contains(Modifier::BOLD));
+            .any(|cell| cell.fg == inverted && cell.modifier.contains(Modifier::BOLD));
         assert!(
             highlighted,
-            "expected a bold white cell for the selected LED"
+            "expected a bold inverted-color number for the selected LED"
         );
     }
 
-    /// In all-mode no single LED is highlighted (no bold white label, no ring).
+    /// In all-mode no single LED is highlighted (no bold number, no ring).
     #[test]
     fn frame_shows_no_single_highlight_in_all_mode() {
         let mut leds = LedBank::new();
@@ -451,9 +513,77 @@ mod tests {
             .expect("draw should not fail");
 
         let content = terminal.backend_mut().buffer().content();
+        let inverted = to_ratatui_color(app.leds.selected().color().inverse());
         let highlighted = content
             .iter()
-            .any(|cell| cell.fg == RColor::White && cell.modifier.contains(Modifier::BOLD));
+            .any(|cell| cell.fg == inverted && cell.modifier.contains(Modifier::BOLD));
         assert!(!highlighted, "all-mode should not highlight a single LED");
+    }
+
+    /// The disc inside the ring is filled with dots in the wedge colors: with
+    /// all LEDs red, far more than the 8 ring dots are lit red.
+    #[test]
+    fn frame_fills_the_disc_with_the_wedge_colors() {
+        let app = App {
+            leds: LedBank::new(),
+            error: None,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(80, 24))
+            .expect("test backend should initialize");
+        terminal
+            .draw(|frame| draw(frame, &app))
+            .expect("draw should not fail");
+
+        let content = terminal.backend_mut().buffer().content();
+        let red = RColor::Rgb(255, 0, 0);
+        let reds = content.iter().filter(|cell| cell.fg == red).count();
+        assert!(
+            reds > 50,
+            "expected a disc filled with red dots, found {reds} red cells"
+        );
+    }
+
+    /// The LED numbers sit inside their wedges and are drawn in the inverse
+    /// of the wedge's color: with all LEDs red, all 8 numbers are cyan.
+    #[test]
+    fn frame_numbers_are_inversed_to_their_area() {
+        let app = App {
+            leds: LedBank::new(),
+            error: None,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(80, 24))
+            .expect("test backend should initialize");
+        terminal
+            .draw(|frame| draw(frame, &app))
+            .expect("draw should not fail");
+
+        let content = terminal.backend_mut().buffer().content();
+        let inverted = RColor::Rgb(0, 255, 255); // inverse of red
+        let count = content.iter().filter(|cell| cell.fg == inverted).count();
+        assert_eq!(
+            count, LED_COUNT,
+            "expected one inverted number per LED, found {count}"
+        );
+    }
+
+    /// Each LED's own angle falls in its own wedge, and the wedges are the
+    /// 45° sectors centered on the LEDs (with wrap-around at the top).
+    #[test]
+    fn led_wedge_at_angle_maps_wedges_to_leds() {
+        for index in 0..LED_COUNT {
+            assert_eq!(
+                led_wedge_at_angle(led_angle(index)),
+                index,
+                "LED {index} center"
+            );
+            // A step just short of the 22.5° wedge boundary stays inside.
+            let inside = std::f64::consts::FRAC_PI_8 - 1.0e-6;
+            assert_eq!(led_wedge_at_angle(led_angle(index) + inside), index);
+            assert_eq!(led_wedge_at_angle(led_angle(index) - inside), index);
+        }
+        // Angles wrap around the top: 80° is still LED 1's wedge, -10° is
+        // LED 7's.
+        assert_eq!(led_wedge_at_angle(80.0f64.to_radians()), 0);
+        assert_eq!(led_wedge_at_angle((-10.0f64).to_radians()), 6);
     }
 }

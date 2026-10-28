@@ -21,6 +21,13 @@ impl Color {
     pub const fn new(r: u8, g: u8, b: u8) -> Self {
         Self { r, g, b }
     }
+
+    /// The inverse color: each channel flipped against 255 (e.g.
+    /// `(255, 0, 0)` becomes `(0, 255, 255)`). Useful for text that has to
+    /// stay readable on top of this color.
+    pub const fn inverse(self) -> Color {
+        Color::new(255 - self.r, 255 - self.g, 255 - self.b)
+    }
 }
 
 /// Errors that can occur while controlling the fan.
@@ -89,6 +96,14 @@ mod tests {
         let writes = fan.writes.borrow();
         assert_eq!(writes.len(), 1, "write should perform exactly one write");
         assert_eq!(writes[0], colors, "the written colors must be recorded");
+    }
+
+    /// `inverse` flips each channel against 255.
+    #[test]
+    fn inverse_flips_each_channel() {
+        assert_eq!(Color::new(255, 0, 0).inverse(), Color::new(0, 255, 255));
+        assert_eq!(Color::new(0, 0, 0).inverse(), Color::new(255, 255, 255));
+        assert_eq!(Color::new(128, 200, 10).inverse(), Color::new(127, 55, 245));
     }
 
     /// `write` rejects a color slice with a length different from [`LED_COUNT`].
