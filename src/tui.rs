@@ -8,8 +8,8 @@
 //! inverse of the wedge's color (a red wedge gets a cyan number, and so on) so
 //! it stays readable on any color.
 //!
-//! Under the ring, a vertical hue slider shows the color wheel (red at the top
-//! wrapping around to red at the bottom); it picks a hue to set the target LED
+//! Under the ring, a color bar shows a row of fixed color blocks (black on the
+//! left, white on the right); it picks one of the blocks to set the target LED
 //! (or every LED in all-mode) to, as a quick alternative to the `r`/`g`/`b`
 //! channel keys.
 //!
@@ -22,9 +22,9 @@
 //! - `b` / `B` — increase / decrease blue
 //! - `c` — toggle the target LED (or every LED in all-mode) between off
 //!   (black) and the color it had before
-//! - `Left` / `Right` — move the hue slider down / up the color wheel (it
+//! - `Left` / `Right` — move the color bar's pointer one block left / right (it
 //!   wraps around at the ends) and set the target LED (or all LEDs) to that
-//!   hue; selecting a LED re-points the slider at its current hue
+//!   block's color; selecting a LED re-points the pointer at the nearest block
 //! - `t` — toggle the rotation: while on, the colors shift one position
 //!   around the ring at the current rotation speed (LED 1's color moves to
 //!   LED 8, and so on). While every LED is off the rotation is stopped
@@ -84,8 +84,9 @@ const POLL_TIMEOUT: Duration = Duration::from_millis(100);
 /// How often the thermal data (temperatures and fan speeds) is refreshed.
 const THERMAL_INTERVAL: Duration = Duration::from_secs(10);
 
-/// The height of the hue slider (rows, including its title and borders).
-const HUE_SLIDER_HEIGHT: u16 = 12;
+/// The height of the color bar (rows, including its title and borders): one
+/// row for the RGB/hex readout, one for the color blocks, plus the borders.
+const COLOR_BAR_HEIGHT: u16 = 4;
 
 /// Radius of the fan ring in canvas units.
 const RING_RADIUS: f64 = 10.0;
@@ -100,56 +101,93 @@ const VIEW: f64 = 12.0;
 /// Radius of the small white ring drawn around the selected LED.
 const SELECT_RADIUS: f64 = 1.0;
 
-/// A hue slider: a position on the color wheel (`0..=1`) and the helpers to
-/// move it. The position runs at full float precision; only the on-screen
-/// marker is rounded to a terminal row.
+/// The 27 colors of the color bar, from black (left) to white (right).
+const PALETTE: [Color; 27] = [
+    Color::BLACK,
+    Color::new(255, 0, 0),
+    Color::new(255, 122, 0),
+    Color::new(255, 255, 0),
+    Color::new(122, 255, 0),
+    Color::new(0, 255, 0),
+    Color::new(0, 255, 122),
+    Color::new(0, 255, 255),
+    Color::new(0, 122, 255),
+    Color::new(0, 0, 255),
+    Color::new(122, 0, 255),
+    Color::new(255, 0, 255),
+    Color::new(255, 0, 122),
+    Color::new(122, 0, 0),
+    Color::new(122, 122, 0),
+    Color::new(0, 122, 0),
+    Color::new(0, 122, 122),
+    Color::new(0, 0, 122),
+    Color::new(122, 0, 122),
+    Color::new(122, 122, 122),
+    Color::new(255, 122, 122),
+    Color::new(122, 255, 122),
+    Color::new(122, 122, 255),
+    Color::new(122, 255, 255),
+    Color::new(255, 122, 255),
+    Color::new(255, 255, 122),
+    Color::WHITE,
+];
+
+/// A row of fixed color blocks (see [`PALETTE`]) with a pointer over one of
+/// them. `Left`/`Right` move the pointer one block at a time, wrapping around
+/// at the ends.
 #[derive(Debug, Clone, Copy)]
-struct HueSlider {
-    /// The chosen hue as a fraction of the full spectrum (`0..=1`). `0` and
-    /// `1` are both red: the wheel wraps around.
-    pos: f64,
+struct ColorBar {
+    /// The index of the block under the pointer (`0..PALETTE.len()`).
+    pos: usize,
 }
 
-impl HueSlider {
-    /// The fraction of the spectrum one key press moves the cursor: `1/360`
-    /// is 1° of hue.
-    const STEP: f64 = 1.0 / 360.0;
-
-    /// A slider at the start of the wheel (red).
+impl ColorBar {
+    /// A bar with the pointer on the first block (black).
     fn new() -> Self {
-        Self { pos: 0.0 }
+        Self { pos: 0 }
     }
 
-    /// Step the cursor down the wheel, wrapping around at the ends.
+    /// Move the pointer one block left, wrapping around at the ends.
     fn move_left(&mut self) {
-        self.pos = (self.pos - Self::STEP).rem_euclid(1.0);
+        self.pos = (self.pos + PALETTE.len() - 1) % PALETTE.len();
     }
 
-    /// Step the cursor up the wheel, wrapping around at the ends.
+    /// Move the pointer one block right, wrapping around at the ends.
     fn move_right(&mut self) {
-        self.pos = (self.pos + Self::STEP).rem_euclid(1.0);
+        self.pos = (self.pos + 1) % PALETTE.len();
     }
 
-    /// Point the cursor at `hue` degrees, wrapping into the spectrum.
-    fn set_hue(&mut self, hue: f64) {
-        self.pos = hue.rem_euclid(360.0) / 360.0;
+    /// Point the pointer at the block nearest `color`.
+    fn set_nearest(&mut self, color: Color) {
+        self.pos = PALETTE
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, candidate)| color_distance(**candidate, color))
+            .map(|(index, _)| index)
+            .unwrap_or(0);
     }
 
-    /// The chosen hue in degrees (`0..=360`).
-    fn hue(&self) -> f64 {
-        self.pos * 360.0
-    }
-
-    /// The chosen color: a fully saturated [`Color`] at the chosen hue.
+    /// The block under the pointer.
     fn color(&self) -> Color {
-        Color::from_hue(self.hue())
+        PALETTE[self.pos]
     }
 
-    /// The chosen color as a hex string, e.g. `#FF7A00`.
-    fn hex(&self) -> String {
-        let color = self.color();
-        format!("#{:02X}{:02X}{:02X}", color.r, color.g, color.b)
+    /// The pointer's color as `RGB(r, g, b)  #rrggbb`.
+    fn readout(&self) -> String {
+        let c = self.color();
+        format!(
+            "RGB({:3}, {:3}, {:3})  #{:02X}{:02X}{:02X}",
+            c.r, c.g, c.b, c.r, c.g, c.b
+        )
     }
+}
+
+/// The squared distance between two colors in RGB space.
+fn color_distance(a: Color, b: Color) -> i32 {
+    let dr = i32::from(a.r) - i32::from(b.r);
+    let dg = i32::from(a.g) - i32::from(b.g);
+    let db = i32::from(a.b) - i32::from(b.b);
+    dr * dr + dg * dg + db * db
 }
 
 /// State of the TUI.
@@ -164,8 +202,8 @@ struct App {
     /// The last thermal snapshot (temperatures and fan speeds), refreshed every
     /// [`THERMAL_INTERVAL`]; `None` until the first successful read.
     thermal: Option<ThermalSnapshot>,
-    /// The hue slider drawn under the fan ring.
-    slider: HueSlider,
+    /// The color bar drawn under the fan ring.
+    color_bar: ColorBar,
 }
 
 impl App {
@@ -200,30 +238,30 @@ impl App {
         Self::from_state(state::load())
     }
 
-    /// Build an app around `leds`, pointing the hue slider at the hue of the
-    /// currently selected LED.
+    /// Build an app around `leds`, pointing the color bar's pointer at the
+    /// block nearest the currently selected LED's color.
     fn new(leds: LedBank) -> Self {
         let mut app = Self {
             leds,
             speed: SpeedControl::new(),
             error: None,
             thermal: None,
-            slider: HueSlider::new(),
+            color_bar: ColorBar::new(),
         };
-        app.sync_slider();
+        app.sync_color_bar();
         app
     }
 
-    /// Point the hue slider at the hue of the currently selected LED, so its
-    /// cursor matches that LED's color.
-    fn sync_slider(&mut self) {
-        self.slider.set_hue(self.leds.selected().color().hue());
+    /// Point the color bar's pointer at the block nearest the currently
+    /// selected LED's color, so the pointer matches that LED's color.
+    fn sync_color_bar(&mut self) {
+        self.color_bar.set_nearest(self.leds.selected().color());
     }
 
-    /// Set the target LED (or every LED in all-mode) to the slider's color and
-    /// write the fan.
-    fn apply_hue<F: FanController>(&mut self, fan: &F) {
-        self.leds.set_color(self.slider.color());
+    /// Set the target LED (or every LED in all-mode) to the color bar's pointed
+    /// color and write the fan.
+    fn apply_color<F: FanController>(&mut self, fan: &F) {
+        self.leds.set_color(self.color_bar.color());
         self.apply(fan);
         self.persist();
     }
@@ -296,10 +334,10 @@ impl App {
             KeyCode::Char('q') | KeyCode::Esc => return false,
             // Selecting a LED only changes the target of future color keys; it
             // does not change the fan, so no write is needed. It re-points the
-            // hue slider at the newly selected LED's hue.
+            // color bar's pointer at the block nearest the selected LED's color.
             KeyCode::Char(c @ '1'..='8') => {
                 self.leds.select_from_key(c);
-                self.sync_slider();
+                self.sync_color_bar();
                 return true;
             }
             KeyCode::Char('a') => {
@@ -327,17 +365,17 @@ impl App {
             }
             KeyCode::Up => return self.nudge_speed(SPEED_STEP, fan),
             KeyCode::Down => return self.nudge_speed(-SPEED_STEP, fan),
-            // The hue slider: move the cursor down / up the wheel (wrapping
-            // around at the ends), then set the target LED(s) to the chosen
+            // The color bar: move the pointer one block left / right (wrapping
+            // around at the ends), then set the target LED(s) to that block's
             // color.
             KeyCode::Left => {
-                self.slider.move_left();
-                self.apply_hue(fan);
+                self.color_bar.move_left();
+                self.apply_color(fan);
                 return true;
             }
             KeyCode::Right => {
-                self.slider.move_right();
-                self.apply_hue(fan);
+                self.color_bar.move_right();
+                self.apply_color(fan);
                 return true;
             }
             KeyCode::Char('x') => return self.toggle_auto(fan),
@@ -577,13 +615,13 @@ fn draw(frame: &mut Frame, app: &App) {
 }
 
 /// The fan area: the vertical speed bar to the left, then the fan column
-/// (the ring and the hue slider under it), then the thermal panel.
+/// (the ring and the color bar under it), then the thermal panel.
 fn draw_fan(frame: &mut Frame, app: &App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Length(4), // speed bar
-            Constraint::Min(8),    // fan column (ring + hue slider)
+            Constraint::Min(8),    // fan column (ring + color bar)
             Constraint::Min(20),   // thermal panel
         ])
         .split(area);
@@ -592,17 +630,17 @@ fn draw_fan(frame: &mut Frame, app: &App, area: Rect) {
     draw_thermal(frame, app, chunks[2]);
 }
 
-/// The fan column: the fan ring on top, the hue slider under it.
+/// The fan column: the fan ring on top, the color bar under it.
 fn draw_fan_column(frame: &mut Frame, app: &App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(8),                    // fan ring
-            Constraint::Length(HUE_SLIDER_HEIGHT), // hue slider
+            Constraint::Min(8),                 // fan ring
+            Constraint::Length(COLOR_BAR_HEIGHT), // color bar
         ])
         .split(area);
     draw_fan_ring(frame, app, chunks[0]);
-    draw_hue_slider(frame, &app.slider, chunks[1]);
+    draw_color_bar(frame, &app.color_bar, chunks[1]);
 }
 
 /// The speed bar: a vertical meter filling from the bottom in proportion to
@@ -811,64 +849,50 @@ fn draw_fan_ring(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(canvas, canvas_area);
 }
 
-/// The hue slider: a bordered column whose rows run through the color wheel
-/// (red at the top, wrapping around to red at the bottom). The cursor row
-/// shows a marker and the chosen color's hex, in a contrasting foreground over
-/// that color's background.
-fn draw_hue_slider(frame: &mut Frame, slider: &HueSlider, area: Rect) {
-    let block = Block::default().borders(Borders::ALL).title(" Hue ");
+/// The color bar: a bordered panel with the pointer's color as an RGB and hex
+/// readout on the top row, and one row of [`PALETTE.len()`] color blocks
+/// below it. The pointer is an up arrow on the bottom border, centered under
+/// the selected block.
+fn draw_color_bar(frame: &mut Frame, bar: &ColorBar, area: Rect) {
+    let block = Block::default().borders(Borders::ALL).title(" Color ");
     frame.render_widget(&block, area);
     let inner = block.inner(area);
-    if inner.height == 0 {
+    if inner.height < 2 {
         return;
     }
     let buf = frame.buffer_mut();
-    let rows = inner.height;
-    // The wheel: the top row is hue 0 (red), the bottom row is hue just under
-    // 360 (red again), so it wraps around.
-    for (i, y) in (inner.y..inner.y + rows).enumerate() {
-        let hue = (i as f64 / (rows - 1).max(1) as f64) * 360.0;
-        let color = to_ratatui_color(Color::from_hue(hue));
-        for x in inner.x..inner.x + inner.width {
-            buf[(x, y)]
-                .set_char(' ')
-                .set_style(Style::default().bg(color));
-        }
-    }
-    // The cursor: the row nearest the chosen hue, marked with an arrow and the
-    // hex of the chosen color, both in a contrasting foreground over the
-    // color's background.
-    let cursor_row = ((slider.pos * (rows - 1).max(1) as f64).round() as u16).min(rows - 1);
-    let y = inner.y + cursor_row;
-    let color = slider.color();
-    let bg = to_ratatui_color(color);
-    let fg = contrast_foreground(color);
-    let text = format!("▶ {}", slider.hex());
-    for (i, ch) in text.chars().enumerate() {
+
+    // Top row: the pointer's color as `RGB(r, g, b)  #rrggbb`.
+    for (i, ch) in bar.readout().chars().enumerate() {
         let x = inner.x + i as u16;
         if x >= inner.x + inner.width {
             break;
         }
-        buf[(x, y)]
-            .set_char(ch)
-            .set_style(Style::default().fg(fg).bg(bg));
+        buf[(x, inner.y)].set_char(ch);
     }
-}
 
-/// The foreground that stays readable on `color`: black on a light color,
-/// white on a dark one, decided by the color's relative luminance.
-fn contrast_foreground(color: Color) -> RColor {
-    if luminance(color) > 0.5 {
-        RColor::Black
-    } else {
-        RColor::White
+    // Block row: one swatch per palette color, split evenly across the width.
+    let (width, count) = (inner.width as usize, PALETTE.len());
+    for (index, color) in PALETTE.iter().enumerate() {
+        let start = inner.x + (index * width / count) as u16;
+        let end = inner.x + ((index + 1) * width / count) as u16;
+        if start == end {
+            continue;
+        }
+        let bg = to_ratatui_color(*color);
+        for x in start..end {
+            buf[(x, inner.y + 1)].set_char(' ').set_style(Style::default().bg(bg));
+        }
     }
-}
 
-/// Relative luminance of `color` in `0..=1` (Rec. 709 channel weights).
-fn luminance(color: Color) -> f64 {
-    (0.2126 * f64::from(color.r) + 0.7152 * f64::from(color.g) + 0.0722 * f64::from(color.b))
-        / 255.0
+    // The pointer: an up arrow on the bottom border, centered under the
+    // selected block.
+    let start = inner.x + (bar.pos * width / count) as u16;
+    let end = inner.x + ((bar.pos + 1) * width / count) as u16;
+    if start < end {
+        let column = start + (end - start) / 2;
+        buf[(column, inner.y + inner.height)].set_char('▲');
+    }
 }
 
 /// Title bar: app name, the active target (a LED, or all of them), and its
@@ -905,7 +929,7 @@ fn footer(app: &App) -> Paragraph<'static> {
         Span::styled(" c ", Style::default().fg(RColor::Cyan)),
         Span::raw("off "),
         Span::styled(" ←→ ", Style::default().fg(RColor::Cyan)),
-        Span::raw("hue "),
+        Span::raw("color "),
         Span::styled(" ↑↓ ", Style::default().fg(RColor::Cyan)),
         Span::raw("spd "),
         Span::styled(" x ", Style::default().fg(RColor::Cyan)),
@@ -1844,120 +1868,106 @@ mod tests {
         );
     }
 
-    /// One key press moves the cursor by exactly 1° of hue, so the color
-    /// changes by only a few RGB units.
+    /// `move_left`/`move_right` step the pointer one block at a time, wrapping
+    /// around the ends of the bar instead of clamping.
     #[test]
-    fn hue_slider_steps_one_degree_per_press() {
-        let mut slider = HueSlider::new();
-        slider.move_right();
-        assert!((slider.hue() - 1.0).abs() < 1e-9, "one press is one degree");
-        assert_eq!(slider.color(), Color::new(255, 4, 0), "hue 1° is almost red");
-        slider.move_left();
-        assert_eq!(slider.hue(), 0.0, "left returns to the start");
-        slider.move_left();
-        assert!(
-            (slider.hue() - 359.0).abs() < 1e-9,
-            "left at the start wraps around the wheel"
+    fn pointer_steps_one_block_and_wraps_around() {
+        let mut bar = ColorBar::new();
+        assert_eq!(bar.pos, 0, "the pointer starts on the first block");
+        bar.move_right();
+        assert_eq!(bar.pos, 1, "one press moves right one block");
+        bar.move_left();
+        assert_eq!(bar.pos, 0, "one press left returns to the start");
+        bar.move_left();
+        assert_eq!(
+            bar.pos,
+            PALETTE.len() - 1,
+            "left at the start wraps to the last block"
+        );
+        bar.move_right();
+        assert_eq!(bar.pos, 0, "right at the end wraps to the first block");
+    }
+
+    /// `set_nearest` points the pointer at the block nearest the given color.
+    #[test]
+    fn set_nearest_points_at_the_nearest_block() {
+        let mut bar = ColorBar::new();
+        bar.set_nearest(Color::new(0, 255, 0));
+        assert_eq!(bar.pos, 5, "pure green is the green block");
+        bar.set_nearest(Color::new(1, 2, 3));
+        assert_eq!(bar.pos, 0, "a near-black color points at black");
+        bar.set_nearest(Color::new(254, 254, 254));
+        assert_eq!(
+            bar.pos,
+            PALETTE.len() - 1,
+            "a near-white color points at white"
         );
     }
 
-    /// `move_left`/`move_right` step the slider by `HueSlider::STEP`, wrapping
-    /// around the ends of the wheel instead of clamping.
+    /// The bar's color and readout follow the pointer.
     #[test]
-    fn hue_slider_steps_wrap_around_the_wheel() {
-        let mut slider = HueSlider::new();
-        assert_eq!(slider.pos, 0.0, "the slider starts at red");
-        slider.move_right();
-        assert!(
-            (slider.pos - HueSlider::STEP).abs() < 1e-9,
-            "one step forward"
-        );
-        slider.move_left();
-        assert!(
-            slider.pos.abs() < 1e-9,
-            "one step back returns to red"
-        );
-        slider.move_left();
-        assert!(
-            (slider.pos - (1.0 - HueSlider::STEP)).abs() < 1e-9,
-            "left at red wraps to the far end of the wheel"
+    fn color_and_readout_follow_the_pointer() {
+        let mut bar = ColorBar::new();
+        bar.set_nearest(Color::new(0, 255, 0));
+        assert_eq!(bar.color(), Color::new(0, 255, 0), "the green block is green");
+        assert_eq!(bar.readout(), "RGB(  0, 255,   0)  #00FF00");
+        bar.move_left();
+        assert_eq!(
+            bar.color(),
+            Color::new(122, 255, 0),
+            "left of green is the chartreuse block"
         );
     }
 
-    /// `set_hue` points the slider at the given hue, wrapping into the
-    /// spectrum (positive and negative).
+    /// `Right` moves the pointer one block and sets the selected LED to that
+    /// block's color, writing the fan.
     #[test]
-    fn hue_slider_set_hue_wraps_into_the_spectrum() {
-        let mut slider = HueSlider::new();
-        slider.set_hue(120.0);
-        assert!((slider.pos - 120.0 / 360.0).abs() < 1e-9);
-        slider.set_hue(420.0);
-        assert!((slider.pos - 60.0 / 360.0).abs() < 1e-9, "wraps past 360");
-        slider.set_hue(-90.0);
-        assert!(
-            (slider.pos - 270.0 / 360.0).abs() < 1e-9,
-            "wraps negative hues"
-        );
-    }
-
-    /// The slider's color and hex follow its hue.
-    #[test]
-    fn hue_slider_color_and_hex_follow_the_hue() {
-        let mut slider = HueSlider::new();
-        slider.set_hue(120.0);
-        assert_eq!(slider.color(), Color::new(0, 255, 0), "hue 120 is green");
-        assert_eq!(slider.hex(), "#00FF00");
-        slider.set_hue(0.0);
-        assert_eq!(slider.color(), Color::new(255, 0, 0), "hue 0 is red");
-        assert_eq!(slider.hex(), "#FF0000");
-    }
-
-    /// `Right` moves the slider forward and sets the selected LED to the new
-    /// hue, writing the fan.
-    #[test]
-    fn right_moves_the_hue_and_sets_the_selected_led() {
+    fn right_moves_the_pointer_and_sets_the_selected_led() {
         let fan = CountingFan::default();
         let mut app = App::new(red_bank());
-        assert_eq!(app.slider.pos, 0.0, "the slider starts at the selected red");
+        assert_eq!(app.color_bar.pos, 1, "the pointer starts at the selected red");
 
         assert!(
             app.handle_key(KeyCode::Right, &fan),
             "Right keeps the app running"
         );
-        assert!((app.slider.hue() - HueSlider::STEP * 360.0).abs() < 1e-9);
+        assert_eq!(app.color_bar.pos, 2, "the pointer moves one block right");
         assert_eq!(
             app.leds.selected().color(),
-            app.slider.color(),
-            "the LED takes the slider's color"
+            app.color_bar.color(),
+            "the LED takes the block's color"
         );
         assert_eq!(fan.writes.get(), 1, "the new color is written to the fan");
     }
 
-    /// `Left` at the start of the wheel wraps around to the far end and
-    /// applies the wrapped color.
+    /// `Left` at the first block wraps around to the last and applies its color.
     #[test]
-    fn left_at_the_start_wraps_around_the_wheel() {
+    fn left_at_the_first_block_wraps_around() {
         let fan = CountingFan::default();
         let mut app = App::new(red_bank());
+        app.color_bar.set_nearest(Color::BLACK);
+        assert_eq!(app.color_bar.pos, 0, "the pointer is on the first block");
+
         assert!(
             app.handle_key(KeyCode::Left, &fan),
             "Left keeps the app running"
         );
-        assert!(
-            (app.slider.hue() - 359.0).abs() < 1e-9,
-            "the slider wraps to the far end of the wheel"
+        assert_eq!(
+            app.color_bar.pos,
+            PALETTE.len() - 1,
+            "the pointer wraps to the last block (white)"
         );
         assert_eq!(
             app.leds.selected().color(),
-            app.slider.color(),
+            Color::WHITE,
             "the LED takes the wrapped color"
         );
         assert_eq!(fan.writes.get(), 1, "the new color is written to the fan");
     }
 
-    /// In all-mode a hue key sets every LED to the chosen color.
+    /// In all-mode a color bar key sets every LED to the pointed color.
     #[test]
-    fn a_hue_key_sets_every_led_in_all_mode() {
+    fn a_bar_key_sets_every_led_in_all_mode() {
         let fan = CountingFan::default();
         let mut app = App::new(red_bank());
         app.leds.toggle_all();
@@ -1967,9 +1977,9 @@ mod tests {
             app.handle_key(KeyCode::Right, &fan),
             "Right keeps the app running"
         );
-        let color = app.slider.color();
+        let color = app.color_bar.color();
         for led_color in app.leds.colors() {
-            assert_eq!(led_color, color, "every LED takes the slider's color");
+            assert_eq!(led_color, color, "every LED takes the block's color");
         }
         assert_eq!(fan.writes.get(), 1, "the new color is written to the fan");
     }
@@ -2051,27 +2061,24 @@ mod tests {
         );
     }
 
-    /// Selecting a LED re-points the hue slider at that LED's hue (without
-    /// writing the fan).
+    /// Selecting a LED re-points the pointer at the block nearest that LED's
+    /// color (without writing the fan).
     #[test]
-    fn selecting_a_led_repoints_the_hue_slider() {
+    fn selecting_a_led_repoints_the_color_bar() {
         let fan = CountingFan::default();
         let mut leds = red_bank();
         leds.select(3);
         leds.set_color(Color::new(0, 255, 0)); // LED 3 is green, and selected
         let mut app = App::new(leds);
-        assert!(
-            (app.slider.pos - 120.0 / 360.0).abs() < 1e-9,
-            "the slider starts at the selected green"
-        );
+        assert_eq!(app.color_bar.pos, 5, "the pointer starts at the selected green");
 
         assert!(
             app.handle_key(KeyCode::Char('1'), &fan),
             "selecting keeps the app running"
         );
         assert_eq!(
-            app.slider.pos, 0.0,
-            "selecting the red LED re-points the slider at red"
+            app.color_bar.pos, 1,
+            "selecting the red LED re-points the pointer at red"
         );
         assert_eq!(
             fan.writes.get(),
@@ -2080,10 +2087,11 @@ mod tests {
         );
     }
 
-    /// The hue slider is drawn under the ring: it has a " Hue " title, a
-    /// saturated-green band in the wheel, and the cursor's hex readout.
+    /// The color bar is drawn under the ring: it has a " Color " title, the
+    /// pointer's RGB/hex readout, and one block per palette color (black on the
+    /// left, white on the right).
     #[test]
-    fn draw_shows_the_hue_slider() {
+    fn draw_shows_the_color_bar() {
         let app = App::new(red_bank());
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("test backend");
         terminal
@@ -2095,12 +2103,24 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol().to_string())
             .collect();
-        assert!(text.contains(" Hue "), "the slider has a title");
-        let green_band = content.iter().any(|cell| cell.bg == RColor::Rgb(0, 255, 0));
-        assert!(green_band, "the wheel includes a saturated green band");
+        assert!(text.contains(" Color "), "the bar has a title");
         assert!(
             text.contains("#FF0000"),
-            "the cursor shows the hex of the chosen (red) color"
+            "the readout shows the pointer's (red) hex"
+        );
+        assert!(
+            text.contains('▲'),
+            "the pointer sits on the bottom border as an up arrow"
+        );
+        let black = RColor::Rgb(0, 0, 0);
+        let white = RColor::Rgb(255, 255, 255);
+        assert!(
+            content.iter().any(|cell| cell.bg == black),
+            "the bar includes a black block"
+        );
+        assert!(
+            content.iter().any(|cell| cell.bg == white),
+            "the bar includes a white block"
         );
     }
 
