@@ -18,12 +18,18 @@
 //! - `t` — toggle the rotation: while on, the colors shift one position
 //!   around the ring every 1/8 s (LED 1's color moves to LED 8, and so on)
 //! - `s` — flip the rotation direction (clockwise ↔ counter-clockwise)
+//! - `Up` / `Down` — increase / decrease the fan speed by 3% (a vertical bar
+//!   to the left of the ring shows the speed in percent); while the EC's
+//!   automatic fan control is on, the value is stored and written when the
+//!   control is switched off
+//! - `x` — toggle the EC's automatic fan control
 //! - `q` or `Esc` — quit
 //!
 //! On start the app restores the colors it set last time, so it never
 //! overwrites a lit fan; when every LED is off it lights the fan with a
 //! rainbow. The EC cannot report the current colors, so the app keeps them in
-//! a state file (see [`crate::state`]).
+//! a state file (see [`crate::state`]). The fan speed cannot be read back
+//! either, so it starts at 50% under manual control.
 
 use std::io::{self, Stdout};
 use std::time::{Duration, Instant};
@@ -35,15 +41,15 @@ use crossterm::terminal::{
 };
 use crossterm::execute;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color as RColor, Modifier, Style};
 use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
 use ratatui::{Frame, Terminal};
 use ratatui::widgets::canvas::{Canvas, Circle, Context, Points};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Block, Borders, Paragraph};
 
-use crate::fan::{Color, FanController, LED_COUNT};
+use crate::fan::{Color, FanController, LED_COUNT, SPEED_STEP, SpeedControl};
 use crate::led::{Channel, LedBank, RotationDirection, COLOR_STEP};
 use crate::state;
 
@@ -72,6 +78,8 @@ const SELECT_RADIUS: f64 = 1.0;
 struct App {
     /// The per-LED colors and the currently selected LED.
     leds: LedBank,
+    /// The fan speed in percent and whether the EC's automatic control is on.
+    speed: SpeedControl,
     /// Error from the last fan write, if any (shown in the footer).
     error: Option<String>,
 }
@@ -90,16 +98,37 @@ impl App {
         // No state file: the fan is assumed to be off, so light it with a
         // fresh rainbow.
         let Some(colors) = loaded else {
-            return (Self { leds: LedBank::rainbow(), error: None }, true);
+            return (
+                Self {
+                    leds: LedBank::rainbow(),
+                    speed: SpeedControl::new(),
+                    error: None,
+                },
+                true,
+            );
         };
         // A saved state with at least one lit LED is the fan's current state:
         // restore it and leave the fan alone. Every LED black means the fan
         // is off, so fall back to the rainbow as well.
         let leds = LedBank::from_colors(colors);
         if leds.any_lit() {
-            (Self { leds, error: None }, false)
+            (
+                Self {
+                    leds,
+                    speed: SpeedControl::new(),
+                    error: None,
+                },
+                false,
+            )
         } else {
-            (Self { leds: LedBank::rainbow(), error: None }, true)
+            (
+                Self {
+                    leds: LedBank::rainbow(),
+                    speed: SpeedControl::new(),
+                    error: None,
+                },
+                true,
+            )
         }
     }
 
@@ -118,6 +147,42 @@ impl App {
     /// back, so without this the app could not tell a lit fan from an off one.
     fn persist(&self) {
         let _ = state::save(&self.leds.colors());
+    }
+
+    /// Push the stored speed to the fan, remembering any error for display.
+    fn apply_speed<F: FanController>(&mut self, fan: &F) {
+        self.error = fan
+            .set_speed(self.speed.percent())
+            .err()
+            .map(|err| err.to_string());
+    }
+
+    /// Hand the speed over to the EC's automatic control, remembering any
+    /// error for display.
+    fn apply_auto_control<F: FanController>(&mut self, fan: &F) {
+        self.error = fan.enable_auto_control().err().map(|err| err.to_string());
+    }
+
+    /// Handle an arrow key: move the speed by `step` and write it to the fan
+    /// when it changed and the automatic control is off (in auto mode the EC
+    /// owns the speed, so the value is only stored).
+    fn nudge_speed<F: FanController>(&mut self, step: i8, fan: &F) -> bool {
+        if self.speed.nudge(step) && !self.speed.auto_control() {
+            self.apply_speed(fan);
+        }
+        true
+    }
+
+    /// Handle `x`: toggle the EC's automatic fan control. Turning it on hands
+    /// the speed to the EC; turning it off re-asserts the stored speed, which
+    /// takes the fan out of the EC's control.
+    fn toggle_auto<F: FanController>(&mut self, fan: &F) -> bool {
+        if self.speed.toggle_auto_control() {
+            self.apply_auto_control(fan);
+        } else {
+            self.apply_speed(fan);
+        }
+        true
     }
 
     /// Handle a key press. Returns `false` when the app should quit.
@@ -145,6 +210,9 @@ impl App {
                 self.leds.flip_direction();
                 return true;
             }
+            KeyCode::Up => return self.nudge_speed(SPEED_STEP, fan),
+            KeyCode::Down => return self.nudge_speed(-SPEED_STEP, fan),
+            KeyCode::Char('x') => return self.toggle_auto(fan),
             KeyCode::Char('r') => self.leds.nudge(Channel::Red, COLOR_STEP),
             KeyCode::Char('R') => self.leds.nudge(Channel::Red, -COLOR_STEP),
             KeyCode::Char('g') => self.leds.nudge(Channel::Green, COLOR_STEP),
@@ -315,20 +383,77 @@ fn run_loop<F: FanController>(
     Ok(())
 }
 
-/// Render one frame: title, fan ring, and footer.
+/// Render one frame: title, fan (speed bar and ring), and footer.
 fn draw(frame: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1), // title
-            Constraint::Min(4),    // fan ring
+            Constraint::Min(4),    // fan
             Constraint::Length(2), // footer
         ])
         .split(frame.area());
 
     frame.render_widget(title(app), chunks[0]);
-    draw_ring(frame, app, chunks[1]);
+    draw_fan(frame, app, chunks[1]);
     frame.render_widget(footer(app), chunks[2]);
+}
+
+/// The fan area: the vertical speed bar to the left of the fan ring.
+fn draw_fan(frame: &mut Frame, app: &App, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(4), // speed bar
+            Constraint::Min(8),    // fan ring
+        ])
+        .split(area);
+    draw_speed_bar(frame, app, chunks[0]);
+    draw_fan_ring(frame, app, chunks[1]);
+}
+
+/// The speed bar: a vertical meter filling from the bottom in proportion to
+/// the speed, with the speed in percent (or "auto" while the EC's automatic
+/// control is on) as the label below.
+fn draw_speed_bar(frame: &mut Frame, app: &App, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(1),    // the bar
+            Constraint::Length(1), // the label
+        ])
+        .split(area);
+
+    let percent = app.speed.percent();
+    let auto = app.speed.auto_control();
+    // In auto mode the EC decides the speed, so the stored value is shown
+    // dimmed instead of the live green.
+    let live = if auto { RColor::DarkGray } else { RColor::Green };
+
+    let block = Block::default().borders(Borders::ALL);
+    frame.render_widget(&block, chunks[0]);
+    let inner = block.inner(chunks[0]);
+    let height = inner.height;
+    let filled = (f64::from(height) * f64::from(percent) / 100.0).round() as u16;
+    let lines = (0..height)
+        .map(|row| {
+            let lit = row >= height - filled;
+            let fg = if lit { live } else { RColor::DarkGray };
+            Line::from(Span::styled("██", Style::default().fg(fg)))
+        })
+        .collect::<Vec<Line>>();
+    frame.render_widget(Paragraph::new(lines), inner);
+
+    let label = if auto {
+        "auto".to_string()
+    } else {
+        format!("{percent}%")
+    };
+    let label = Line::from(Span::styled(
+        label,
+        Style::default().fg(live).add_modifier(Modifier::BOLD),
+    ));
+    frame.render_widget(Paragraph::new(label).alignment(Alignment::Center), chunks[1]);
 }
 
 /// Draw the fan: a disc filled with dots in the per-LED wedge colors, a dim
@@ -336,7 +461,7 @@ fn draw(frame: &mut Frame, app: &App) {
 /// wedges — each number drawn in the inverse of its wedge's color.
 ///
 /// The selected LED is highlighted with a small white ring and a bold number.
-fn draw_ring(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_fan_ring(frame: &mut Frame, app: &App, area: Rect) {
     // Terminal cells are about twice as tall as they are wide, so give the
     // canvas twice as many columns as rows to make the circle look round.
     let height = (area.height / 2).max(4);
@@ -437,16 +562,20 @@ fn title(app: &App) -> Paragraph<'static> {
 fn footer(app: &App) -> Paragraph<'static> {
     let hint = Line::from(vec![
         Span::styled(" 1-8 ", Style::default().fg(RColor::Cyan)),
-        Span::raw("select   "),
+        Span::raw("sel  "),
         Span::styled(" a ", Style::default().fg(RColor::Cyan)),
-        Span::raw("all   "),
+        Span::raw("all  "),
         Span::styled(" r/R g/G b/B ", Style::default().fg(RColor::Cyan)),
-        Span::raw("adjust   "),
+        Span::raw("adj  "),
+        Span::styled(" ↑/↓ ", Style::default().fg(RColor::Cyan)),
+        Span::raw("speed  "),
+        Span::styled(" x ", Style::default().fg(RColor::Cyan)),
+        Span::raw("auto  "),
         Span::styled(" t ", Style::default().fg(RColor::Cyan)),
-        Span::raw("rotate   "),
+        Span::raw("rot  "),
         Span::styled(" s ", Style::default().fg(RColor::Cyan)),
-        Span::raw("CW/CCW   "),
-        Span::styled("q/Esc ", Style::default().fg(RColor::Cyan)),
+        Span::raw("dir  "),
+        Span::styled(" q ", Style::default().fg(RColor::Cyan)),
         Span::raw("quit"),
     ]);
     // The rotation state: off, or the direction the colors travel.
@@ -546,6 +675,7 @@ mod tests {
     fn frame_renders_a_lit_point_per_led() {
         let app = App {
             leds: red_bank(),
+            speed: SpeedControl::new(),
             error: None,
         };
         let mut terminal = Terminal::new(TestBackend::new(80, 24))
@@ -577,7 +707,11 @@ mod tests {
         leds.nudge(Channel::Red, -255);
         leds.nudge(Channel::Blue, 255);
 
-        let app = App { leds, error: None };
+        let app = App {
+            leds,
+            speed: SpeedControl::new(),
+            error: None,
+        };
         let mut terminal = Terminal::new(TestBackend::new(80, 24))
             .expect("test backend should initialize");
         terminal
@@ -601,7 +735,11 @@ mod tests {
         let mut leds = red_bank();
         leds.select(8);
 
-        let app = App { leds, error: None };
+        let app = App {
+            leds,
+            speed: SpeedControl::new(),
+            error: None,
+        };
         let mut terminal = Terminal::new(TestBackend::new(80, 24))
             .expect("test backend should initialize");
         terminal
@@ -626,7 +764,11 @@ mod tests {
         leds.toggle_all();
         assert!(leds.all_mode());
 
-        let app = App { leds, error: None };
+        let app = App {
+            leds,
+            speed: SpeedControl::new(),
+            error: None,
+        };
         let mut terminal = Terminal::new(TestBackend::new(80, 24))
             .expect("test backend should initialize");
         terminal
@@ -647,6 +789,7 @@ mod tests {
     fn frame_fills_the_disc_with_the_wedge_colors() {
         let app = App {
             leds: red_bank(),
+            speed: SpeedControl::new(),
             error: None,
         };
         let mut terminal = Terminal::new(TestBackend::new(80, 24))
@@ -670,6 +813,7 @@ mod tests {
     fn frame_numbers_are_inversed_to_their_area() {
         let app = App {
             leds: red_bank(),
+            speed: SpeedControl::new(),
             error: None,
         };
         let mut terminal = Terminal::new(TestBackend::new(80, 24))
@@ -742,15 +886,26 @@ mod tests {
         assert_eq!(no_state.leds.colors(), LedBank::rainbow().colors());
     }
 
-    /// A fan that records how many times it was written.
+    /// A fan that records every interaction: the LED writes, the speeds it
+    /// was set to, and how often the auto control was enabled.
     #[derive(Default)]
     struct CountingFan {
         writes: std::cell::Cell<usize>,
+        speeds: std::cell::RefCell<Vec<u8>>,
+        auto_enables: std::cell::Cell<usize>,
     }
 
     impl FanController for CountingFan {
         fn write(&self, _colors: &[Color]) -> Result<(), crate::fan::FanError> {
             self.writes.set(self.writes.get() + 1);
+            Ok(())
+        }
+        fn set_speed(&self, percent: u8) -> Result<(), crate::fan::FanError> {
+            self.speeds.borrow_mut().push(percent);
+            Ok(())
+        }
+        fn enable_auto_control(&self) -> Result<(), crate::fan::FanError> {
+            self.auto_enables.set(self.auto_enables.get() + 1);
             Ok(())
         }
     }
@@ -762,6 +917,7 @@ mod tests {
         let fan = CountingFan::default();
         let mut app = App {
             leds: red_bank(),
+            speed: SpeedControl::new(),
             error: None,
         };
 
@@ -799,6 +955,7 @@ mod tests {
             leds: LedBank::from_colors(std::array::from_fn(|i| {
                 Color::new((i + 1) as u8, 0, 0)
             })),
+            speed: SpeedControl::new(),
             error: None,
         };
         app.leds.toggle_rotation();
@@ -810,5 +967,182 @@ mod tests {
         let colors = app.leds.colors();
         assert_eq!(colors[7], Color::new(1, 0, 0), "LED 1's color lands on LED 8");
         assert_eq!(colors[0], Color::new(2, 0, 0), "LED 2's color lands on LED 1");
+    }
+
+    /// An app with a red bank whose speed is `percent` (manual mode).
+    fn app_with_speed(percent: u8) -> App {
+        let mut app = App {
+            leds: red_bank(),
+            speed: SpeedControl::new(),
+            error: None,
+        };
+        while app.speed.percent() != percent {
+            let step = if app.speed.percent() < percent { 1 } else { -1 };
+            assert!(app.speed.nudge(step), "the speed steps toward {percent}");
+        }
+        app
+    }
+
+    /// `Up`/`Down` move the speed by 3% and write it to the fan, without
+    /// touching the LEDs or the auto control.
+    #[test]
+    fn arrow_keys_change_the_speed_and_write_the_fan() {
+        let fan = CountingFan::default();
+        let mut app = App {
+            leds: red_bank(),
+            speed: SpeedControl::new(),
+            error: None,
+        };
+
+        assert!(app.handle_key(KeyCode::Up, &fan), "Up keeps the app running");
+        assert_eq!(app.speed.percent(), 53, "Up raises the speed by 3%");
+        assert!(app.handle_key(KeyCode::Down, &fan), "Down keeps the app running");
+        assert_eq!(app.speed.percent(), 50, "Down lowers the speed by 3%");
+
+        assert_eq!(
+            fan.speeds.borrow().as_slice(),
+            &[53, 50],
+            "each change writes the new speed to the fan"
+        );
+        assert_eq!(fan.writes.get(), 0, "the speed keys do not write the LEDs");
+        assert_eq!(
+            fan.auto_enables.get(),
+            0,
+            "the speed keys do not touch the auto control"
+        );
+    }
+
+    /// At 100% `Up` and at 0% `Down` keep the speed in place and skip the
+    /// write.
+    #[test]
+    fn arrow_keys_clamp_the_speed_and_skip_the_write() {
+        let fan = CountingFan::default();
+
+        let mut at_top = app_with_speed(100);
+        assert!(at_top.handle_key(KeyCode::Up, &fan));
+        assert_eq!(at_top.speed.percent(), 100, "the speed cannot go above 100");
+        assert!(
+            fan.speeds.borrow().is_empty(),
+            "a clamped change does not write"
+        );
+
+        let mut at_bottom = app_with_speed(0);
+        assert!(at_bottom.handle_key(KeyCode::Down, &fan));
+        assert_eq!(at_bottom.speed.percent(), 0, "the speed cannot go below 0");
+        assert!(
+            fan.speeds.borrow().is_empty(),
+            "a clamped change does not write"
+        );
+    }
+
+    /// `x` hands the speed over to the EC; the second `x` takes it back at
+    /// the stored speed.
+    #[test]
+    fn x_toggles_the_auto_fan_control() {
+        let fan = CountingFan::default();
+        let mut app = app_with_speed(67);
+
+        assert!(app.handle_key(KeyCode::Char('x'), &fan), "x keeps the app running");
+        assert!(app.speed.auto_control(), "x turns the auto control on");
+        assert_eq!(
+            fan.auto_enables.get(),
+            1,
+            "turning it on hands the speed to the EC"
+        );
+        assert!(
+            fan.speeds.borrow().is_empty(),
+            "handing over writes no speed"
+        );
+
+        assert!(app.handle_key(KeyCode::Char('x'), &fan));
+        assert!(!app.speed.auto_control(), "the second x turns it off again");
+        assert_eq!(
+            fan.speeds.borrow().as_slice(),
+            &[67],
+            "turning it off re-asserts the stored speed"
+        );
+    }
+
+    /// In auto mode the arrow keys still move the stored speed, but the fan
+    /// is not written (the EC owns the speed).
+    #[test]
+    fn arrow_keys_store_the_speed_without_writing_in_auto_mode() {
+        let fan = CountingFan::default();
+        let mut app = App {
+            leds: red_bank(),
+            speed: SpeedControl::new(),
+            error: None,
+        };
+        app.handle_key(KeyCode::Char('x'), &fan);
+
+        assert!(app.handle_key(KeyCode::Up, &fan));
+        assert_eq!(app.speed.percent(), 53, "the stored speed still moves");
+        assert!(
+            fan.speeds.borrow().is_empty(),
+            "no speed write while auto is on"
+        );
+    }
+
+    /// The speed bar fills from the bottom in proportion to the speed.
+    #[test]
+    fn speed_bar_fills_in_proportion_to_the_speed() {
+        let fill_cells = |percent| {
+            let app = app_with_speed(percent);
+            let mut terminal = Terminal::new(TestBackend::new(80, 24))
+                .expect("test backend should initialize");
+            terminal
+                .draw(|frame| draw(frame, &app))
+                .expect("draw should not fail");
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .filter(|cell| cell.symbol() == "█" && cell.fg == RColor::Green)
+                .count()
+        };
+
+        let at_zero = fill_cells(0);
+        let at_half = fill_cells(50);
+        let at_full = fill_cells(100);
+
+        assert_eq!(at_zero, 0, "a 0% bar has no lit cells");
+        assert!(at_half > 0, "a 50% bar is partly lit");
+        assert!(
+            at_full > at_half,
+            "a 100% bar is more lit than a 50% one"
+        );
+    }
+
+    /// The bar's label shows the speed in percent, or "auto" while the EC's
+    /// automatic control is on.
+    #[test]
+    fn speed_bar_label_shows_the_percent_or_auto() {
+        let app = app_with_speed(50);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24))
+            .expect("test backend should initialize");
+        terminal
+            .draw(|frame| draw(frame, &app))
+            .expect("draw should not fail");
+        let labeled = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .any(|cell| cell.symbol() == "%" && cell.fg == RColor::Green);
+        assert!(labeled, "manual mode is labeled with the speed in percent");
+
+        let mut auto_app = app_with_speed(50);
+        auto_app.speed.toggle_auto_control();
+        terminal
+            .draw(|frame| draw(frame, &auto_app))
+            .expect("draw should not fail");
+        let labeled = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .any(|cell| cell.symbol() == "u" && cell.fg == RColor::DarkGray);
+        assert!(labeled, "auto mode is labeled with 'auto'");
     }
 }

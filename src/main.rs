@@ -5,7 +5,9 @@
 //! 8) with the `1` to `8` keys and adjust its color with the `r`/`R`, `g`/`G`
 //! and `b`/`B` keys; press `a` to adjust every LED at once, `t` to rotate the
 //! colors around the ring (one position every 1/8 s) and `s` to flip the
-//! rotation direction, and `q` to quit.
+//! rotation direction. A vertical bar to the left of the circle shows the
+//! fan speed in percent: `Up`/`Down` move it by 3%, and `x` toggles the EC's
+//! automatic fan control. Press `q` to quit.
 //!
 //! Requires root and a Framework Desktop:
 //!

@@ -37,4 +37,16 @@ impl FanController for FrameworkFan {
             .rgbkbd_set_color(0, rgb)
             .map_err(FanError::Ec)
     }
+
+    fn set_speed(&self, percent: u8) -> Result<(), FanError> {
+        // Without a fan index the command applies to the fan as a whole,
+        // the same way `framework_tool --fansetduty <percent>` does it.
+        CrosEc::new()
+            .fan_set_duty(None, u32::from(percent))
+            .map_err(FanError::Ec)
+    }
+
+    fn enable_auto_control(&self) -> Result<(), FanError> {
+        CrosEc::new().autofanctrl(None).map_err(FanError::Ec)
+    }
 }

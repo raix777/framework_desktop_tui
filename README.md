@@ -18,6 +18,12 @@ second the color of LED 1 moves to position 8, the color of 8 to position 7,
 and so on (one full turn per second); `s` flips the direction between
 clockwise and counter-clockwise.
 
+A vertical bar to the left of the circle shows the fan speed in percent.
+`Up` and `Down` move it by 3% at a time (clamped to 0–100%), and `x` toggles
+the EC's automatic fan control: while it is on, the EC decides the speed, and
+the stored value is applied the moment it is switched off. The speed starts
+at 50% under manual control (the EC cannot report it back).
+
 On start the app restores the colors it set last time, so it never overwrites
 a lit fan (the EC cannot report the current colors, so the app keeps them in
 `~/.local/state/framework_desktop_tui/leds.txt`). When every LED is off, it
@@ -50,6 +56,10 @@ sudo ./target/release/framework_desktop_tui
 |            | turn per second)                                   |
 | `s`        | flip the rotation direction (clockwise /           |
 |            | counter-clockwise)                                 |
+| `Up`/`Down`| increase / decrease the fan speed by 3%; while the |
+|            | automatic control is on the value is stored and    |
+|            | applied when it is switched off                    |
+| `x`        | toggle the EC's automatic fan control              |
 | `q`/`Esc`  | quit                                               |
 
 If the fan cannot be reached (no hardware, not root), the error is shown in
