@@ -20,9 +20,9 @@
 //! - `r` / `R` — increase / decrease red (selected LED, or all when toggled)
 //! - `g` / `G` — increase / decrease green
 //! - `b` / `B` — increase / decrease blue
-//! - `Left` / `Right` — move the hue slider down / up the color wheel and set
-//!   the target LED (or all LEDs) to that hue; selecting a LED re-points the
-//!   slider at its current hue, and `Home` / `End` jump to the wheel's ends
+//! - `Left` / `Right` — move the hue slider down / up the color wheel (it
+//!   wraps around at the ends) and set the target LED (or all LEDs) to that
+//!   hue; selecting a LED re-points the slider at its current hue
 //! - `t` — toggle the rotation: while on, the colors shift one position
 //!   around the ring every 1/8 s (LED 1's color moves to LED 8, and so on)
 //! - `s` — flip the rotation direction (clockwise ↔ counter-clockwise)
@@ -106,34 +106,28 @@ struct HueSlider {
 }
 
 impl HueSlider {
-    /// The fraction of the spectrum one key press moves the cursor: `1/120`
-    /// is 3° of hue.
-    const STEP: f64 = 1.0 / 120.0;
+    /// The fraction of the spectrum one key press moves the cursor: `1/360`
+    /// is 1° of hue.
+    const STEP: f64 = 1.0 / 360.0;
 
     /// A slider at the start of the wheel (red).
     fn new() -> Self {
         Self { pos: 0.0 }
     }
 
+    /// Step the cursor down the wheel, wrapping around at the ends.
     fn move_left(&mut self) {
-        self.pos = (self.pos - Self::STEP).max(0.0);
+        self.pos = (self.pos - Self::STEP).rem_euclid(1.0);
     }
 
+    /// Step the cursor up the wheel, wrapping around at the ends.
     fn move_right(&mut self) {
-        self.pos = (self.pos + Self::STEP).min(1.0);
+        self.pos = (self.pos + Self::STEP).rem_euclid(1.0);
     }
 
-    fn jump_home(&mut self) {
-        self.pos = 0.0;
-    }
-
-    fn jump_end(&mut self) {
-        self.pos = 1.0;
-    }
-
-    /// Point the cursor at `hue` degrees, clamped to the spectrum.
+    /// Point the cursor at `hue` degrees, wrapping into the spectrum.
     fn set_hue(&mut self, hue: f64) {
-        self.pos = (hue.rem_euclid(360.0) / 360.0).clamp(0.0, 1.0);
+        self.pos = hue.rem_euclid(360.0) / 360.0;
     }
 
     /// The chosen hue in degrees (`0..=360`).
@@ -320,8 +314,9 @@ impl App {
             }
             KeyCode::Up => return self.nudge_speed(SPEED_STEP, fan),
             KeyCode::Down => return self.nudge_speed(-SPEED_STEP, fan),
-            // The hue slider: move the cursor down / up the wheel, or jump to
-            // an end, then set the target LED(s) to the chosen color.
+            // The hue slider: move the cursor down / up the wheel (wrapping
+            // around at the ends), then set the target LED(s) to the chosen
+            // color.
             KeyCode::Left => {
                 self.slider.move_left();
                 self.apply_hue(fan);
@@ -329,16 +324,6 @@ impl App {
             }
             KeyCode::Right => {
                 self.slider.move_right();
-                self.apply_hue(fan);
-                return true;
-            }
-            KeyCode::Home => {
-                self.slider.jump_home();
-                self.apply_hue(fan);
-                return true;
-            }
-            KeyCode::End => {
-                self.slider.jump_end();
                 self.apply_hue(fan);
                 return true;
             }
@@ -1705,27 +1690,44 @@ mod tests {
         assert!(text.contains("2500 RPM"), "the fan speed is shown");
     }
 
-    /// `move_left`/`move_right` step the slider by `HueSlider::STEP`, clamped
-    /// to the ends of the spectrum, and `jump_home`/`jump_end` snap to them.
+    /// One key press moves the cursor by exactly 1° of hue, so the color
+    /// changes by only a few RGB units.
     #[test]
-    fn hue_slider_steps_clamps_and_jumps() {
+    fn hue_slider_steps_one_degree_per_press() {
+        let mut slider = HueSlider::new();
+        slider.move_right();
+        assert!((slider.hue() - 1.0).abs() < 1e-9, "one press is one degree");
+        assert_eq!(slider.color(), Color::new(255, 4, 0), "hue 1° is almost red");
+        slider.move_left();
+        assert_eq!(slider.hue(), 0.0, "left returns to the start");
+        slider.move_left();
+        assert!(
+            (slider.hue() - 359.0).abs() < 1e-9,
+            "left at the start wraps around the wheel"
+        );
+    }
+
+    /// `move_left`/`move_right` step the slider by `HueSlider::STEP`, wrapping
+    /// around the ends of the wheel instead of clamping.
+    #[test]
+    fn hue_slider_steps_wrap_around_the_wheel() {
         let mut slider = HueSlider::new();
         assert_eq!(slider.pos, 0.0, "the slider starts at red");
-        slider.move_left();
-        assert_eq!(slider.pos, 0.0, "cannot go below red");
         slider.move_right();
         assert!(
             (slider.pos - HueSlider::STEP).abs() < 1e-9,
             "one step forward"
         );
-        for _ in 0..240 {
-            slider.move_right();
-        }
-        assert_eq!(slider.pos, 1.0, "cannot go past the end");
-        slider.jump_home();
-        assert_eq!(slider.pos, 0.0, "home snaps to red");
-        slider.jump_end();
-        assert_eq!(slider.pos, 1.0, "end snaps to the far red");
+        slider.move_left();
+        assert!(
+            slider.pos.abs() < 1e-9,
+            "one step back returns to red"
+        );
+        slider.move_left();
+        assert!(
+            (slider.pos - (1.0 - HueSlider::STEP)).abs() < 1e-9,
+            "left at red wraps to the far end of the wheel"
+        );
     }
 
     /// `set_hue` points the slider at the given hue, wrapping into the
@@ -1751,7 +1753,7 @@ mod tests {
         slider.set_hue(120.0);
         assert_eq!(slider.color(), Color::new(0, 255, 0), "hue 120 is green");
         assert_eq!(slider.hex(), "#00FF00");
-        slider.jump_home();
+        slider.set_hue(0.0);
         assert_eq!(slider.color(), Color::new(255, 0, 0), "hue 0 is red");
         assert_eq!(slider.hex(), "#FF0000");
     }
@@ -1777,16 +1779,26 @@ mod tests {
         assert_eq!(fan.writes.get(), 1, "the new color is written to the fan");
     }
 
-    /// `Left` at the start of the wheel clamps at red and still applies.
+    /// `Left` at the start of the wheel wraps around to the far end and
+    /// applies the wrapped color.
     #[test]
-    fn left_at_the_start_clamps_at_red() {
+    fn left_at_the_start_wraps_around_the_wheel() {
         let fan = CountingFan::default();
         let mut app = App::new(red_bank());
         assert!(
             app.handle_key(KeyCode::Left, &fan),
             "Left keeps the app running"
         );
-        assert_eq!(app.slider.pos, 0.0, "the slider clamps at red");
+        assert!(
+            (app.slider.hue() - 359.0).abs() < 1e-9,
+            "the slider wraps to the far end of the wheel"
+        );
+        assert_eq!(
+            app.leds.selected().color(),
+            app.slider.color(),
+            "the LED takes the wrapped color"
+        );
+        assert_eq!(fan.writes.get(), 1, "the new color is written to the fan");
     }
 
     /// In all-mode a hue key sets every LED to the chosen color.
