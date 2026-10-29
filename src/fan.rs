@@ -57,6 +57,33 @@ impl Color {
             (b * 255.0).round() as u8,
         )
     }
+
+    /// The dominant hue of this color in degrees (`0..360`): the
+    /// [`from_hue`](Self::from_hue) input that would give this color's hue.
+    /// Inverts [`from_hue`] for the fully saturated colors it produces.
+    /// Achromatic colors (all channels equal, e.g. black, white, grey) have no
+    /// hue and map to `0`.
+    pub fn hue(self) -> f64 {
+        let (r, g, b) = (
+            f64::from(self.r) / 255.0,
+            f64::from(self.g) / 255.0,
+            f64::from(self.b) / 255.0,
+        );
+        let max = r.max(g).max(b);
+        let min = r.min(g).min(b);
+        let delta = max - min;
+        if delta == 0.0 {
+            return 0.0;
+        }
+        let hue = if max == r {
+            (g - b) / delta
+        } else if max == g {
+            (b - r) / delta + 2.0
+        } else {
+            (r - g) / delta + 4.0
+        };
+        (hue * 60.0).rem_euclid(360.0)
+    }
 }
 
 /// The neutral fan speed the app assumes before it has controlled the fan:
@@ -372,6 +399,31 @@ mod tests {
         assert_eq!(Color::from_hue(180.0), Color::new(0, 255, 255), "cyan");
         assert_eq!(Color::from_hue(45.0), Color::new(255, 191, 0), "orange");
         assert_eq!(Color::from_hue(-90.0), Color::new(128, 0, 255), "violet");
+    }
+
+    /// `hue` recovers the hue of the pure primary colors.
+    #[test]
+    fn hue_of_the_pure_hues_is_their_angle() {
+        assert_eq!(Color::new(255, 0, 0).hue(), 0.0, "red is hue 0");
+        assert_eq!(Color::new(0, 255, 0).hue(), 120.0, "green is hue 120");
+        assert_eq!(Color::new(0, 0, 255).hue(), 240.0, "blue is hue 240");
+    }
+
+    /// `hue` inverts `from_hue` for the fully saturated colors it produces.
+    #[test]
+    fn hue_round_trips_with_from_hue() {
+        for hue in [0.0, 30.0, 90.0, 150.0, 210.0, 300.0, 359.0] {
+            let back = Color::from_hue(hue).hue();
+            assert!((back - hue).abs() < 1.0, "hue {hue} came back as {back}");
+        }
+    }
+
+    /// `hue` maps an achromatic color (all channels equal) to 0.
+    #[test]
+    fn hue_of_an_achromatic_color_is_zero() {
+        assert_eq!(Color::BLACK.hue(), 0.0);
+        assert_eq!(Color::new(255, 255, 255).hue(), 0.0, "white has no hue");
+        assert_eq!(Color::new(120, 120, 120).hue(), 0.0, "grey has no hue");
     }
 
     /// `write` rejects a color slice with a length different from [`LED_COUNT`].

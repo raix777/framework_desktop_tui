@@ -248,6 +248,18 @@ impl LedBank {
         }
     }
 
+    /// Set the target LED(s) to `color`: every LED when all-mode is on,
+    /// otherwise just the selected one.
+    pub fn set_color(&mut self, color: Color) {
+        if self.all_mode {
+            for led in &mut self.leds {
+                led.color = color;
+            }
+        } else {
+            self.leds[self.selected].color = color;
+        }
+    }
+
     /// The colors of all LEDs in ring order, ready for `FanController::write`.
     pub fn colors(&self) -> Vec<Color> {
         self.leds.iter().map(|led| led.color).collect()
@@ -343,6 +355,38 @@ mod tests {
                 Color::new(255, 0, COLOR_STEP as u8),
                 "LED {index} should have shifted blue"
             );
+        }
+    }
+
+    /// `set_color` sets only the selected LED by default.
+    #[test]
+    fn set_color_sets_only_the_selected_led_by_default() {
+        let mut bank = red_bank();
+        bank.select(3);
+        bank.set_color(Color::new(0, 255, 0));
+
+        let colors = bank.colors();
+        assert_eq!(colors[2], Color::new(0, 255, 0));
+        for (index, color) in colors.iter().enumerate() {
+            if index != 2 {
+                assert_eq!(
+                    *color,
+                    Color::new(255, 0, 0),
+                    "LED {index} should be untouched"
+                );
+            }
+        }
+    }
+
+    /// With all-mode on, `set_color` sets every LED to the same color.
+    #[test]
+    fn set_color_sets_every_led_in_all_mode() {
+        let mut bank = red_bank();
+        bank.toggle_all();
+        bank.set_color(Color::new(0, 0, 255));
+
+        for color in bank.colors() {
+            assert_eq!(color, Color::new(0, 0, 255), "every LED should be set");
         }
     }
 

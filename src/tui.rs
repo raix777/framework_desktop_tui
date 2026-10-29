@@ -8,6 +8,11 @@
 //! inverse of the wedge's color (a red wedge gets a cyan number, and so on) so
 //! it stays readable on any color.
 //!
+//! Under the ring, a vertical hue slider shows the color wheel (red at the top
+//! wrapping around to red at the bottom); it picks a hue to set the target LED
+//! (or every LED in all-mode) to, as a quick alternative to the `r`/`g`/`b`
+//! channel keys.
+//!
 //! Keys:
 //! - `1`..`8` — select the LED to adjust (no fan write needed)
 //! - `a` — toggle "all LEDs" mode: when on, color keys adjust every LED at
@@ -15,6 +20,9 @@
 //! - `r` / `R` — increase / decrease red (selected LED, or all when toggled)
 //! - `g` / `G` — increase / decrease green
 //! - `b` / `B` — increase / decrease blue
+//! - `Left` / `Right` — move the hue slider down / up the color wheel and set
+//!   the target LED (or all LEDs) to that hue; selecting a LED re-points the
+//!   slider at its current hue, and `Home` / `End` jump to the wheel's ends
 //! - `t` — toggle the rotation: while on, the colors shift one position
 //!   around the ring every 1/8 s (LED 1's color moves to LED 8, and so on)
 //! - `s` — flip the rotation direction (clockwise ↔ counter-clockwise)
@@ -71,6 +79,9 @@ const ROTATION_INTERVAL: Duration = Duration::from_millis(125);
 /// How often the thermal data (temperatures and fan speeds) is refreshed.
 const THERMAL_INTERVAL: Duration = Duration::from_secs(10);
 
+/// The height of the hue slider (rows, including its title and borders).
+const HUE_SLIDER_HEIGHT: u16 = 12;
+
 /// Radius of the fan ring in canvas units.
 const RING_RADIUS: f64 = 10.0;
 
@@ -84,6 +95,64 @@ const VIEW: f64 = 12.0;
 /// Radius of the small white ring drawn around the selected LED.
 const SELECT_RADIUS: f64 = 1.0;
 
+/// A hue slider: a position on the color wheel (`0..=1`) and the helpers to
+/// move it. The position runs at full float precision; only the on-screen
+/// marker is rounded to a terminal row.
+#[derive(Debug, Clone, Copy)]
+struct HueSlider {
+    /// The chosen hue as a fraction of the full spectrum (`0..=1`). `0` and
+    /// `1` are both red: the wheel wraps around.
+    pos: f64,
+}
+
+impl HueSlider {
+    /// The fraction of the spectrum one key press moves the cursor: `1/120`
+    /// is 3° of hue.
+    const STEP: f64 = 1.0 / 120.0;
+
+    /// A slider at the start of the wheel (red).
+    fn new() -> Self {
+        Self { pos: 0.0 }
+    }
+
+    fn move_left(&mut self) {
+        self.pos = (self.pos - Self::STEP).max(0.0);
+    }
+
+    fn move_right(&mut self) {
+        self.pos = (self.pos + Self::STEP).min(1.0);
+    }
+
+    fn jump_home(&mut self) {
+        self.pos = 0.0;
+    }
+
+    fn jump_end(&mut self) {
+        self.pos = 1.0;
+    }
+
+    /// Point the cursor at `hue` degrees, clamped to the spectrum.
+    fn set_hue(&mut self, hue: f64) {
+        self.pos = (hue.rem_euclid(360.0) / 360.0).clamp(0.0, 1.0);
+    }
+
+    /// The chosen hue in degrees (`0..=360`).
+    fn hue(&self) -> f64 {
+        self.pos * 360.0
+    }
+
+    /// The chosen color: a fully saturated [`Color`] at the chosen hue.
+    fn color(&self) -> Color {
+        Color::from_hue(self.hue())
+    }
+
+    /// The chosen color as a hex string, e.g. `#FF7A00`.
+    fn hex(&self) -> String {
+        let color = self.color();
+        format!("#{:02X}{:02X}{:02X}", color.r, color.g, color.b)
+    }
+}
+
 /// State of the TUI.
 #[derive(Debug)]
 struct App {
@@ -96,6 +165,8 @@ struct App {
     /// The last thermal snapshot (temperatures and fan speeds), refreshed every
     /// [`THERMAL_INTERVAL`]; `None` until the first successful read.
     thermal: Option<Thermal>,
+    /// The hue slider drawn under the fan ring.
+    slider: HueSlider,
 }
 
 impl App {
@@ -112,46 +183,50 @@ impl App {
         // No state file: the fan is assumed to be off, so light it with a
         // fresh rainbow.
         let Some(colors) = loaded else {
-            return (
-                Self {
-                    leds: LedBank::rainbow(),
-                    speed: SpeedControl::new(),
-                    error: None,
-                    thermal: None,
-                },
-                true,
-            );
+            return (Self::new(LedBank::rainbow()), true);
         };
         // A saved state with at least one lit LED is the fan's current state:
         // restore it and leave the fan alone. Every LED black means the fan
         // is off, so fall back to the rainbow as well.
         let leds = LedBank::from_colors(colors);
         if leds.any_lit() {
-            (
-                Self {
-                    leds,
-                    speed: SpeedControl::new(),
-                    error: None,
-                    thermal: None,
-                },
-                false,
-            )
+            (Self::new(leds), false)
         } else {
-            (
-                Self {
-                    leds: LedBank::rainbow(),
-                    speed: SpeedControl::new(),
-                    error: None,
-                    thermal: None,
-                },
-                true,
-            )
+            (Self::new(LedBank::rainbow()), true)
         }
     }
 
     /// Build the app for a fresh run, loading the saved colors first.
     fn startup() -> (Self, bool) {
         Self::from_state(state::load())
+    }
+
+    /// Build an app around `leds`, pointing the hue slider at the hue of the
+    /// currently selected LED.
+    fn new(leds: LedBank) -> Self {
+        let mut app = Self {
+            leds,
+            speed: SpeedControl::new(),
+            error: None,
+            thermal: None,
+            slider: HueSlider::new(),
+        };
+        app.sync_slider();
+        app
+    }
+
+    /// Point the hue slider at the hue of the currently selected LED, so its
+    /// cursor matches that LED's color.
+    fn sync_slider(&mut self) {
+        self.slider.set_hue(self.leds.selected().color().hue());
+    }
+
+    /// Set the target LED (or every LED in all-mode) to the slider's color and
+    /// write the fan.
+    fn apply_hue<F: FanController>(&mut self, fan: &F) {
+        self.leds.set_color(self.slider.color());
+        self.apply(fan);
+        self.persist();
     }
 
     /// Push the per-LED colors to the fan, remembering any error for display.
@@ -220,10 +295,12 @@ impl App {
     fn handle_key<F: FanController>(&mut self, code: KeyCode, fan: &F) -> bool {
         match code {
             KeyCode::Char('q') | KeyCode::Esc => return false,
-            // Selecting a LED or toggling all-mode only changes the target of
-            // future color keys; neither changes the fan, so no write is needed.
+            // Selecting a LED only changes the target of future color keys; it
+            // does not change the fan, so no write is needed. It re-points the
+            // hue slider at the newly selected LED's hue.
             KeyCode::Char(c @ '1'..='8') => {
                 self.leds.select_key(c);
+                self.sync_slider();
                 return true;
             }
             KeyCode::Char('a') => {
@@ -243,6 +320,28 @@ impl App {
             }
             KeyCode::Up => return self.nudge_speed(SPEED_STEP, fan),
             KeyCode::Down => return self.nudge_speed(-SPEED_STEP, fan),
+            // The hue slider: move the cursor down / up the wheel, or jump to
+            // an end, then set the target LED(s) to the chosen color.
+            KeyCode::Left => {
+                self.slider.move_left();
+                self.apply_hue(fan);
+                return true;
+            }
+            KeyCode::Right => {
+                self.slider.move_right();
+                self.apply_hue(fan);
+                return true;
+            }
+            KeyCode::Home => {
+                self.slider.jump_home();
+                self.apply_hue(fan);
+                return true;
+            }
+            KeyCode::End => {
+                self.slider.jump_end();
+                self.apply_hue(fan);
+                return true;
+            }
             KeyCode::Char('x') => return self.toggle_auto(fan),
             KeyCode::Char('r') => self.leds.nudge(Channel::Red, COLOR_STEP),
             KeyCode::Char('R') => self.leds.nudge(Channel::Red, -COLOR_STEP),
@@ -466,19 +565,33 @@ fn draw(frame: &mut Frame, app: &App) {
     frame.render_widget(footer(app), chunks[2]);
 }
 
-/// The fan area: the vertical speed bar to the left of the fan ring.
+/// The fan area: the vertical speed bar to the left, then the fan column
+/// (the ring and the hue slider under it), then the thermal panel.
 fn draw_fan(frame: &mut Frame, app: &App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Length(4), // speed bar
-            Constraint::Min(8),    // fan ring
+            Constraint::Min(8),    // fan column (ring + hue slider)
             Constraint::Min(20),   // thermal panel
         ])
         .split(area);
     draw_speed_bar(frame, app, chunks[0]);
-    draw_fan_ring(frame, app, chunks[1]);
+    draw_fan_column(frame, app, chunks[1]);
     draw_thermal(frame, app, chunks[2]);
+}
+
+/// The fan column: the fan ring on top, the hue slider under it.
+fn draw_fan_column(frame: &mut Frame, app: &App, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(8),                    // fan ring
+            Constraint::Length(HUE_SLIDER_HEIGHT), // hue slider
+        ])
+        .split(area);
+    draw_fan_ring(frame, app, chunks[0]);
+    draw_hue_slider(frame, &app.slider, chunks[1]);
 }
 
 /// The speed bar: a vertical meter filling from the bottom in proportion to
@@ -679,6 +792,66 @@ fn draw_fan_ring(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(canvas, canvas_area);
 }
 
+/// The hue slider: a bordered column whose rows run through the color wheel
+/// (red at the top, wrapping around to red at the bottom). The cursor row
+/// shows a marker and the chosen color's hex, in a contrasting foreground over
+/// that color's background.
+fn draw_hue_slider(frame: &mut Frame, slider: &HueSlider, area: Rect) {
+    let block = Block::default().borders(Borders::ALL).title(" Hue ");
+    frame.render_widget(&block, area);
+    let inner = block.inner(area);
+    if inner.height == 0 {
+        return;
+    }
+    let buf = frame.buffer_mut();
+    let rows = inner.height;
+    // The wheel: the top row is hue 0 (red), the bottom row is hue just under
+    // 360 (red again), so it wraps around.
+    for (i, y) in (inner.y..inner.y + rows).enumerate() {
+        let hue = (i as f64 / (rows - 1).max(1) as f64) * 360.0;
+        let color = to_ratatui_color(Color::from_hue(hue));
+        for x in inner.x..inner.x + inner.width {
+            buf[(x, y)]
+                .set_char(' ')
+                .set_style(Style::default().bg(color));
+        }
+    }
+    // The cursor: the row nearest the chosen hue, marked with an arrow and the
+    // hex of the chosen color, both in a contrasting foreground over the
+    // color's background.
+    let cursor_row = ((slider.pos * (rows - 1).max(1) as f64).round() as u16).min(rows - 1);
+    let y = inner.y + cursor_row;
+    let color = slider.color();
+    let bg = to_ratatui_color(color);
+    let fg = contrast_foreground(color);
+    let text = format!("▶ {}", slider.hex());
+    for (i, ch) in text.chars().enumerate() {
+        let x = inner.x + i as u16;
+        if x >= inner.x + inner.width {
+            break;
+        }
+        buf[(x, y)]
+            .set_char(ch)
+            .set_style(Style::default().fg(fg).bg(bg));
+    }
+}
+
+/// The foreground that stays readable on `color`: black on a light color,
+/// white on a dark one, decided by the color's relative luminance.
+fn contrast_foreground(color: Color) -> RColor {
+    if luminance(color) > 0.5 {
+        RColor::Black
+    } else {
+        RColor::White
+    }
+}
+
+/// Relative luminance of `color` in `0..=1` (Rec. 709 channel weights).
+fn luminance(color: Color) -> f64 {
+    (0.2126 * f64::from(color.r) + 0.7152 * f64::from(color.g) + 0.0722 * f64::from(color.b))
+        / 255.0
+}
+
 /// Title bar: app name, the active target (a LED, or all of them), and its
 /// color.
 fn title(app: &App) -> Paragraph<'static> {
@@ -705,19 +878,21 @@ fn title(app: &App) -> Paragraph<'static> {
 fn footer(app: &App) -> Paragraph<'static> {
     let hint = Line::from(vec![
         Span::styled(" 1-8 ", Style::default().fg(RColor::Cyan)),
-        Span::raw("sel  "),
+        Span::raw("sel "),
         Span::styled(" a ", Style::default().fg(RColor::Cyan)),
-        Span::raw("all  "),
-        Span::styled(" r/R g/G b/B ", Style::default().fg(RColor::Cyan)),
-        Span::raw("adj  "),
-        Span::styled(" ↑/↓ ", Style::default().fg(RColor::Cyan)),
-        Span::raw("speed  "),
+        Span::raw("all "),
+        Span::styled(" r/g/b ", Style::default().fg(RColor::Cyan)),
+        Span::raw("rgb "),
+        Span::styled(" ←→ ", Style::default().fg(RColor::Cyan)),
+        Span::raw("hue "),
+        Span::styled(" ↑↓ ", Style::default().fg(RColor::Cyan)),
+        Span::raw("spd "),
         Span::styled(" x ", Style::default().fg(RColor::Cyan)),
-        Span::raw("auto  "),
+        Span::raw("auto "),
         Span::styled(" t ", Style::default().fg(RColor::Cyan)),
-        Span::raw("rot  "),
+        Span::raw("rot "),
         Span::styled(" s ", Style::default().fg(RColor::Cyan)),
-        Span::raw("dir  "),
+        Span::raw("dir "),
         Span::styled(" q ", Style::default().fg(RColor::Cyan)),
         Span::raw("quit"),
     ]);
@@ -814,14 +989,9 @@ mod tests {
     /// Rendering a frame lights up at least one cell per LED in the fan color.
     #[test]
     fn frame_renders_a_lit_point_per_led() {
-        let app = App {
-            leds: red_bank(),
-            speed: SpeedControl::new(),
-            error: None,
-            thermal: None,
-        };
+        let app = App::new(red_bank());
         let mut terminal =
-            Terminal::new(TestBackend::new(80, 24)).expect("test backend should initialize");
+            Terminal::new(TestBackend::new(80, 40)).expect("test backend should initialize");
         terminal
             .draw(|frame| draw(frame, &app))
             .expect("draw should not fail");
@@ -849,14 +1019,9 @@ mod tests {
         leds.nudge(Channel::Red, -255);
         leds.nudge(Channel::Blue, 255);
 
-        let app = App {
-            leds,
-            speed: SpeedControl::new(),
-            error: None,
-            thermal: None,
-        };
+        let app = App::new(leds);
         let mut terminal =
-            Terminal::new(TestBackend::new(80, 24)).expect("test backend should initialize");
+            Terminal::new(TestBackend::new(80, 40)).expect("test backend should initialize");
         terminal
             .draw(|frame| draw(frame, &app))
             .expect("draw should not fail");
@@ -881,14 +1046,9 @@ mod tests {
         let mut leds = red_bank();
         leds.select(8);
 
-        let app = App {
-            leds,
-            speed: SpeedControl::new(),
-            error: None,
-            thermal: None,
-        };
+        let app = App::new(leds);
         let mut terminal =
-            Terminal::new(TestBackend::new(80, 24)).expect("test backend should initialize");
+            Terminal::new(TestBackend::new(80, 40)).expect("test backend should initialize");
         terminal
             .draw(|frame| draw(frame, &app))
             .expect("draw should not fail");
@@ -911,14 +1071,9 @@ mod tests {
         leds.toggle_all();
         assert!(leds.all_mode());
 
-        let app = App {
-            leds,
-            speed: SpeedControl::new(),
-            error: None,
-            thermal: None,
-        };
+        let app = App::new(leds);
         let mut terminal =
-            Terminal::new(TestBackend::new(80, 24)).expect("test backend should initialize");
+            Terminal::new(TestBackend::new(80, 40)).expect("test backend should initialize");
         terminal
             .draw(|frame| draw(frame, &app))
             .expect("draw should not fail");
@@ -935,14 +1090,9 @@ mod tests {
     /// all LEDs red, far more than the 8 ring dots are lit red.
     #[test]
     fn frame_fills_the_disc_with_the_wedge_colors() {
-        let app = App {
-            leds: red_bank(),
-            speed: SpeedControl::new(),
-            error: None,
-            thermal: None,
-        };
+        let app = App::new(red_bank());
         let mut terminal =
-            Terminal::new(TestBackend::new(80, 24)).expect("test backend should initialize");
+            Terminal::new(TestBackend::new(80, 40)).expect("test backend should initialize");
         terminal
             .draw(|frame| draw(frame, &app))
             .expect("draw should not fail");
@@ -960,14 +1110,9 @@ mod tests {
     /// of the wedge's color: with all LEDs red, all 8 numbers are cyan.
     #[test]
     fn frame_numbers_are_inversed_to_their_area() {
-        let app = App {
-            leds: red_bank(),
-            speed: SpeedControl::new(),
-            error: None,
-            thermal: None,
-        };
+        let app = App::new(red_bank());
         let mut terminal =
-            Terminal::new(TestBackend::new(80, 24)).expect("test backend should initialize");
+            Terminal::new(TestBackend::new(80, 40)).expect("test backend should initialize");
         terminal
             .draw(|frame| draw(frame, &app))
             .expect("draw should not fail");
@@ -1099,12 +1244,7 @@ mod tests {
     #[test]
     fn t_and_s_control_the_rotation_without_a_write() {
         let fan = CountingFan::default();
-        let mut app = App {
-            leds: red_bank(),
-            speed: SpeedControl::new(),
-            error: None,
-            thermal: None,
-        };
+        let mut app = App::new(red_bank());
 
         assert!(!app.leds.rotation_on(), "rotation starts off");
         assert!(
@@ -1139,12 +1279,9 @@ mod tests {
     #[test]
     fn rotating_tui_shows_the_shifted_colors() {
         let fan = CountingFan::default();
-        let mut app = App {
-            leds: LedBank::from_colors(std::array::from_fn(|i| Color::new((i + 1) as u8, 0, 0))),
-            speed: SpeedControl::new(),
-            error: None,
-            thermal: None,
-        };
+        let mut app = App::new(LedBank::from_colors(std::array::from_fn(|i| {
+            Color::new((i + 1) as u8, 0, 0)
+        })));
         app.leds.toggle_rotation();
         app.leds.rotate(); // one tick, as the event loop performs it
         app.apply(&fan);
@@ -1166,12 +1303,7 @@ mod tests {
 
     /// An app with a red bank in manual control at `percent`.
     fn app_with_speed(percent: u8) -> App {
-        let mut app = App {
-            leds: red_bank(),
-            speed: SpeedControl::new(),
-            error: None,
-            thermal: None,
-        };
+        let mut app = App::new(red_bank());
         // Take the fan under manual control first (the neutral speed), then
         // step the stored speed to the target.
         let _ = app.speed.toggle();
@@ -1188,12 +1320,7 @@ mod tests {
     #[test]
     fn first_arrow_key_jumps_to_the_high_speed() {
         let fan = CountingFan::default();
-        let mut app = App {
-            leds: red_bank(),
-            speed: SpeedControl::new(),
-            error: None,
-            thermal: None,
-        };
+        let mut app = App::new(red_bank());
 
         assert!(
             app.handle_key(KeyCode::Up, &fan),
@@ -1365,12 +1492,7 @@ mod tests {
     /// percent label).
     #[test]
     fn speed_bar_is_not_drawn_while_disabled() {
-        let app = App {
-            leds: red_bank(),
-            speed: SpeedControl::new(),
-            error: None,
-            thermal: None,
-        };
+        let app = App::new(red_bank());
         assert_eq!(
             app.speed.state(),
             SpeedState::Disabled,
@@ -1378,7 +1500,7 @@ mod tests {
         );
 
         let mut terminal =
-            Terminal::new(TestBackend::new(80, 24)).expect("test backend should initialize");
+            Terminal::new(TestBackend::new(80, 40)).expect("test backend should initialize");
         terminal
             .draw(|frame| draw(frame, &app))
             .expect("draw should not fail");
@@ -1400,7 +1522,7 @@ mod tests {
         let fill_cells = |percent| {
             let app = app_with_speed(percent);
             let mut terminal =
-                Terminal::new(TestBackend::new(80, 24)).expect("test backend should initialize");
+                Terminal::new(TestBackend::new(80, 40)).expect("test backend should initialize");
             terminal
                 .draw(|frame| draw(frame, &app))
                 .expect("draw should not fail");
@@ -1428,7 +1550,7 @@ mod tests {
     fn speed_bar_label_shows_the_percent_or_auto() {
         let app = app_with_speed(50);
         let mut terminal =
-            Terminal::new(TestBackend::new(80, 24)).expect("test backend should initialize");
+            Terminal::new(TestBackend::new(80, 40)).expect("test backend should initialize");
         terminal
             .draw(|frame| draw(frame, &app))
             .expect("draw should not fail");
@@ -1458,12 +1580,7 @@ mod tests {
     #[test]
     fn read_thermal_stores_the_snapshot() {
         let fan = CountingFan::default();
-        let mut app = App {
-            leds: red_bank(),
-            speed: SpeedControl::new(),
-            error: None,
-            thermal: None,
-        };
+        let mut app = App::new(red_bank());
         assert!(app.thermal.is_none(), "no snapshot before the first read");
 
         app.read_thermal(&fan);
@@ -1480,12 +1597,7 @@ mod tests {
     /// A failed `read_thermal` keeps the previous snapshot instead of wiping it.
     #[test]
     fn read_thermal_keeps_the_previous_snapshot_on_failure() {
-        let mut app = App {
-            leds: red_bank(),
-            speed: SpeedControl::new(),
-            error: None,
-            thermal: None,
-        };
+        let mut app = App::new(red_bank());
         app.read_thermal(&CountingFan::default());
         let before = app.thermal.clone().expect("just read");
 
@@ -1501,12 +1613,7 @@ mod tests {
     /// `thermal_lines` lists each sensor (with °C) and fan (with RPM).
     #[test]
     fn thermal_lines_lists_sensors_and_fans() {
-        let mut app = App {
-            leds: red_bank(),
-            speed: SpeedControl::new(),
-            error: None,
-            thermal: None,
-        };
+        let mut app = App::new(red_bank());
         app.read_thermal(&CountingFan::default());
 
         let text = lines_text(&thermal_lines(&app));
@@ -1521,12 +1628,7 @@ mod tests {
     /// Before the first successful read, `thermal_lines` shows a placeholder.
     #[test]
     fn thermal_lines_shows_a_placeholder_before_the_first_read() {
-        let app = App {
-            leds: red_bank(),
-            speed: SpeedControl::new(),
-            error: None,
-            thermal: None,
-        };
+        let app = App::new(red_bank());
 
         let text = lines_text(&thermal_lines(&app));
         assert!(!text.contains("RPM"), "no fan data before the first read");
@@ -1582,12 +1684,7 @@ mod tests {
     /// The thermal panel renders the sensor and fan readings next to the ring.
     #[test]
     fn draw_shows_the_thermal_panel() {
-        let mut app = App {
-            leds: red_bank(),
-            speed: SpeedControl::new(),
-            error: None,
-            thermal: None,
-        };
+        let mut app = App::new(red_bank());
         app.read_thermal(&CountingFan::default());
 
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("test backend");
@@ -1606,6 +1703,162 @@ mod tests {
         );
         assert!(text.contains("45 C"), "the temperature reading is shown");
         assert!(text.contains("2500 RPM"), "the fan speed is shown");
+    }
+
+    /// `move_left`/`move_right` step the slider by `HueSlider::STEP`, clamped
+    /// to the ends of the spectrum, and `jump_home`/`jump_end` snap to them.
+    #[test]
+    fn hue_slider_steps_clamps_and_jumps() {
+        let mut slider = HueSlider::new();
+        assert_eq!(slider.pos, 0.0, "the slider starts at red");
+        slider.move_left();
+        assert_eq!(slider.pos, 0.0, "cannot go below red");
+        slider.move_right();
+        assert!(
+            (slider.pos - HueSlider::STEP).abs() < 1e-9,
+            "one step forward"
+        );
+        for _ in 0..240 {
+            slider.move_right();
+        }
+        assert_eq!(slider.pos, 1.0, "cannot go past the end");
+        slider.jump_home();
+        assert_eq!(slider.pos, 0.0, "home snaps to red");
+        slider.jump_end();
+        assert_eq!(slider.pos, 1.0, "end snaps to the far red");
+    }
+
+    /// `set_hue` points the slider at the given hue, wrapping into the
+    /// spectrum (positive and negative).
+    #[test]
+    fn hue_slider_set_hue_wraps_into_the_spectrum() {
+        let mut slider = HueSlider::new();
+        slider.set_hue(120.0);
+        assert!((slider.pos - 120.0 / 360.0).abs() < 1e-9);
+        slider.set_hue(420.0);
+        assert!((slider.pos - 60.0 / 360.0).abs() < 1e-9, "wraps past 360");
+        slider.set_hue(-90.0);
+        assert!(
+            (slider.pos - 270.0 / 360.0).abs() < 1e-9,
+            "wraps negative hues"
+        );
+    }
+
+    /// The slider's color and hex follow its hue.
+    #[test]
+    fn hue_slider_color_and_hex_follow_the_hue() {
+        let mut slider = HueSlider::new();
+        slider.set_hue(120.0);
+        assert_eq!(slider.color(), Color::new(0, 255, 0), "hue 120 is green");
+        assert_eq!(slider.hex(), "#00FF00");
+        slider.jump_home();
+        assert_eq!(slider.color(), Color::new(255, 0, 0), "hue 0 is red");
+        assert_eq!(slider.hex(), "#FF0000");
+    }
+
+    /// `Right` moves the slider forward and sets the selected LED to the new
+    /// hue, writing the fan.
+    #[test]
+    fn right_moves_the_hue_and_sets_the_selected_led() {
+        let fan = CountingFan::default();
+        let mut app = App::new(red_bank());
+        assert_eq!(app.slider.pos, 0.0, "the slider starts at the selected red");
+
+        assert!(
+            app.handle_key(KeyCode::Right, &fan),
+            "Right keeps the app running"
+        );
+        assert!((app.slider.hue() - HueSlider::STEP * 360.0).abs() < 1e-9);
+        assert_eq!(
+            app.leds.selected().color(),
+            app.slider.color(),
+            "the LED takes the slider's color"
+        );
+        assert_eq!(fan.writes.get(), 1, "the new color is written to the fan");
+    }
+
+    /// `Left` at the start of the wheel clamps at red and still applies.
+    #[test]
+    fn left_at_the_start_clamps_at_red() {
+        let fan = CountingFan::default();
+        let mut app = App::new(red_bank());
+        assert!(
+            app.handle_key(KeyCode::Left, &fan),
+            "Left keeps the app running"
+        );
+        assert_eq!(app.slider.pos, 0.0, "the slider clamps at red");
+    }
+
+    /// In all-mode a hue key sets every LED to the chosen color.
+    #[test]
+    fn a_hue_key_sets_every_led_in_all_mode() {
+        let fan = CountingFan::default();
+        let mut app = App::new(red_bank());
+        app.leds.toggle_all();
+        assert!(app.leds.all_mode());
+
+        assert!(
+            app.handle_key(KeyCode::Right, &fan),
+            "Right keeps the app running"
+        );
+        let color = app.slider.color();
+        for led_color in app.leds.colors() {
+            assert_eq!(led_color, color, "every LED takes the slider's color");
+        }
+        assert_eq!(fan.writes.get(), 1, "the new color is written to the fan");
+    }
+
+    /// Selecting a LED re-points the hue slider at that LED's hue (without
+    /// writing the fan).
+    #[test]
+    fn selecting_a_led_repoints_the_hue_slider() {
+        let fan = CountingFan::default();
+        let mut leds = red_bank();
+        leds.select(3);
+        leds.set_color(Color::new(0, 255, 0)); // LED 3 is green, and selected
+        let mut app = App::new(leds);
+        assert!(
+            (app.slider.pos - 120.0 / 360.0).abs() < 1e-9,
+            "the slider starts at the selected green"
+        );
+
+        assert!(
+            app.handle_key(KeyCode::Char('1'), &fan),
+            "selecting keeps the app running"
+        );
+        assert_eq!(
+            app.slider.pos, 0.0,
+            "selecting the red LED re-points the slider at red"
+        );
+        assert_eq!(
+            fan.writes.get(),
+            0,
+            "selecting a LED does not write the fan"
+        );
+    }
+
+    /// The hue slider is drawn under the ring: it has a " Hue " title, a
+    /// saturated-green band in the wheel, and the cursor's hex readout.
+    #[test]
+    fn draw_shows_the_hue_slider() {
+        let app = App::new(red_bank());
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("test backend");
+        terminal
+            .draw(|frame| draw(frame, &app))
+            .expect("draw should not fail");
+
+        let content = terminal.backend().buffer().content();
+        let text: String = content
+            .iter()
+            .map(|cell| cell.symbol().to_string())
+            .collect();
+        assert!(text.contains(" Hue "), "the slider has a title");
+        let green_band = content.iter().any(|cell| cell.bg == RColor::Rgb(0, 255, 0));
+        assert!(green_band, "the wheel includes a saturated green band");
+        assert!(
+            text.contains("#FF0000"),
+            "the cursor shows the hex of the chosen (red) color"
+        );
     }
 
     /// Concatenate every span's text across the given lines.
