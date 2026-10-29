@@ -12,8 +12,11 @@ unit-testable without hardware.
 
 ## Layout — dependency direction is a hard rule
 
-- `src/fan.rs` — domain model: `Color`, `LED_COUNT`, `FanError`, and the
-  `FanController` trait. Knows nothing about the EC, hardware, or the terminal.
+- `src/fan/` — domain model: `color.rs` (`Color`), `speed.rs`
+  (`SpeedControl`, `SpeedState`), `thermal.rs` (`ThermalSnapshot`),
+  `error.rs` (`FanError`), `controller.rs` (`FanController` trait), and
+  `LED_COUNT` in `mod.rs`. Knows nothing about the EC, hardware, or the
+  terminal.
 - `src/framework_fan.rs` — `FrameworkFan`. The only module allowed to touch
   `framework_lib` / the EC. Implements `FanController`.
 - `src/led.rs` — `LedBank` / `Led` / `Channel` / `RotationDirection`: per-LED
@@ -25,7 +28,7 @@ unit-testable without hardware.
 - `src/main.rs` — wires it together: `tui::run(&FrameworkFan)`.
 
 Rules:
-- Keep `fan.rs` and `led.rs` free of hardware and terminal so they stay
+- Keep `fan/` and `led.rs` free of hardware and terminal so they stay
   testable. New hardware/transport goes behind `FanController`, not into the TUI.
 - Domain types are `Copy` value types; state is explicit (no hidden globals).
 

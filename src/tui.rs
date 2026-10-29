@@ -65,7 +65,9 @@ use ratatui::widgets::canvas::{Canvas, Circle, Context, Points};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{Frame, Terminal};
 
-use crate::fan::{Color, FanController, LED_COUNT, SPEED_STEP, SpeedControl, SpeedState, Thermal};
+use crate::fan::{
+    Color, FanController, LED_COUNT, SPEED_STEP, SpeedControl, SpeedState, ThermalSnapshot,
+};
 use crate::led::{COLOR_STEP, Channel, LedBank, RotationDirection};
 use crate::state;
 
@@ -158,7 +160,7 @@ struct App {
     error: Option<String>,
     /// The last thermal snapshot (temperatures and fan speeds), refreshed every
     /// [`THERMAL_INTERVAL`]; `None` until the first successful read.
-    thermal: Option<Thermal>,
+    thermal: Option<ThermalSnapshot>,
     /// The hue slider drawn under the fan ring.
     slider: HueSlider,
 }
@@ -921,7 +923,7 @@ fn footer(app: &App) -> Paragraph<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fan::{HIGH_SPEED, LOW_SPEED};
+    use crate::fan::speed::{HIGH_SPEED, LOW_SPEED};
     use ratatui::backend::TestBackend;
 
     /// A bank with every LED red, as the frame tests below assume.
@@ -1193,10 +1195,10 @@ mod tests {
             self.auto_enables.set(self.auto_enables.get() + 1);
             Ok(())
         }
-        fn read_thermal(&self) -> Result<Thermal, crate::fan::FanError> {
+        fn read_thermal(&self) -> Result<ThermalSnapshot, crate::fan::FanError> {
             self.thermal_reads.set(self.thermal_reads.get() + 1);
-            Ok(Thermal::new(
-                vec![crate::fan::TempReading::new("APU".to_string(), 45)],
+            Ok(ThermalSnapshot::new(
+                vec![crate::fan::SensorReading::new("APU".to_string(), 45)],
                 vec![crate::fan::FanReading::new("APU Fan".to_string(), 2500)],
             ))
         }
@@ -1216,7 +1218,7 @@ mod tests {
         fn enable_auto_control(&self) -> Result<(), crate::fan::FanError> {
             Ok(())
         }
-        fn read_thermal(&self) -> Result<Thermal, crate::fan::FanError> {
+        fn read_thermal(&self) -> Result<ThermalSnapshot, crate::fan::FanError> {
             Err(crate::fan::FanError::WrongLedCount {
                 expected: LED_COUNT,
                 actual: 0,

@@ -8,7 +8,9 @@ use framework_lib::chromium_ec::CrosEc;
 use framework_lib::chromium_ec::commands::RgbS;
 use framework_lib::power::{self, FanSpeed, TempSensor};
 
-use crate::fan::{Color, FanController, FanError, FanReading, LED_COUNT, TempReading, Thermal};
+use crate::fan::{
+    Color, FanController, FanError, FanReading, LED_COUNT, SensorReading, ThermalSnapshot,
+};
 
 /// Fan controller backed by the Framework embedded controller (EC).
 ///
@@ -50,7 +52,7 @@ impl FanController for FrameworkFan {
         CrosEc::new().autofanctrl(None).map_err(FanError::Ec)
     }
 
-    fn read_thermal(&self) -> Result<Thermal, FanError> {
+    fn read_thermal(&self) -> Result<ThermalSnapshot, FanError> {
         let info = power::get_thermal(&CrosEc::new()).map_err(FanError::Ec)?;
         // Keep only the sensors that report a real temperature and the fans
         // that report a real speed; an absent or stalled one would only
@@ -59,7 +61,7 @@ impl FanController for FrameworkFan {
             .sensors
             .into_iter()
             .filter_map(|sensor| match sensor.temp {
-                TempSensor::Ok(celsius) => Some(TempReading::new(sensor.name, celsius)),
+                TempSensor::Ok(celsius) => Some(SensorReading::new(sensor.name, celsius)),
                 _ => None,
             })
             .collect();
@@ -71,6 +73,6 @@ impl FanController for FrameworkFan {
                 _ => None,
             })
             .collect();
-        Ok(Thermal::new(sensors, fans))
+        Ok(ThermalSnapshot::new(sensors, fans))
     }
 }
