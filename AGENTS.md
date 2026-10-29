@@ -19,8 +19,9 @@ unit-testable without hardware.
   terminal.
 - `src/framework_fan.rs` — `FrameworkFan`. The only module allowed to touch
   `framework_lib` / the EC. Implements `FanController`.
-- `src/led.rs` — `LedBank` / `Led` / `Channel` / `RotationDirection`: per-LED
-  state + key-press→change logic. No terminal, no hardware.
+- `src/led/` — per-LED state + key-press→change logic, split by unit:
+  `Led` in `mod.rs`, plus `bank.rs` (`LedBank`), `channel.rs` (`Channel`),
+  `rotation.rs` (`RotationDirection`). No terminal, no hardware.
 - `src/tui.rs` — presentation: event loop, key handling, ratatui drawing, `App`.
   Talks to the fan only through `FanController`, never through `framework_lib`.
 - `src/state.rs` — persistence: saves/restores the colors, because the EC cannot
@@ -28,7 +29,7 @@ unit-testable without hardware.
 - `src/main.rs` — wires it together: `tui::run(&FrameworkFan)`.
 
 Rules:
-- Keep `fan/` and `led.rs` free of hardware and terminal so they stay
+- Keep `fan/` and `led/` free of hardware and terminal so they stay
   testable. New hardware/transport goes behind `FanController`, not into the TUI.
 - Domain types are `Copy` value types; state is explicit (no hidden globals).
 

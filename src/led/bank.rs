@@ -1,126 +1,28 @@
-//! Per-LED control for the fan.
-//!
-//! The fan has [`LED_COUNT`] addressable LEDs, numbered **1 to 8**: a LED's
-//! number matches the keyboard key that selects it and the label drawn on the
-//! fan ring. Internally the LEDs are indexed `0..LED_COUNT` (as on the EC), so
-//! a number is just `index + 1`.
-//!
-//! [`LedBank`] holds the current color of every LED and which one is selected,
-//! and translates key presses into changes:
-//! - `1`..`8` — select the LED with that number (no fan write needed)
-//! - `r`/`R`, `g`/`G`, `b`/`B` — increase / decrease the selected LED's channel
-//! - `t` — toggle the rotation: the colors travel around the ring, one
-//!   position per step (the TUI steps them every 1/8 s while it is on)
-//! - `s` — flip the rotation direction ([`RotationDirection`])
-
+use super::Led;
+use super::channel::Channel;
+use super::rotation::RotationDirection;
 use crate::fan::{Color, LED_COUNT};
-
-/// Step applied to a color channel per key press.
-pub const COLOR_STEP: i16 = 16;
-
-/// Which color channel a key press targets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Channel {
-    Red,
-    Green,
-    Blue,
-}
-
-impl Channel {
-    /// Add `step` to this channel of `color`, clamping the result to `0..=255`.
-    fn adjust(&self, color: &mut Color, step: i16) {
-        let channel = match self {
-            Channel::Red => &mut color.r,
-            Channel::Green => &mut color.g,
-            Channel::Blue => &mut color.b,
-        };
-        *channel = (*channel as i16 + step).clamp(0, 255) as u8;
-    }
-}
-
-/// The way the colors travel around the ring while rotating.
-///
-/// The LEDs sit on the ring with LED 1 at 12 o'clock and the rest running
-/// counter-clockwise, so "clockwise" means the colors move 1 → 8 → 7 → …:
-/// the color of LED `i` lands on the position of LED `i - 1` (with LED 1's
-/// color wrapping around to LED 8).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RotationDirection {
-    /// Clockwise: LED 1's color moves to LED 8, LED 2's to LED 1, and so on.
-    Clockwise,
-    /// Counter-clockwise: LED 1's color moves to LED 2, LED 2's to LED 3,
-    /// and so on.
-    CounterClockwise,
-}
-
-impl RotationDirection {
-    /// The other direction.
-    pub fn flipped(self) -> Self {
-        match self {
-            Self::Clockwise => Self::CounterClockwise,
-            Self::CounterClockwise => Self::Clockwise,
-        }
-    }
-}
-
-/// A single addressable fan LED.
-///
-/// Numbered 1..=LED_COUNT (1-based), which matches the keyboard key and the
-/// ring label.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Led {
-    /// 1-based LED number, in `1..=LED_COUNT`.
-    number: u8,
-    color: Color,
-}
-
-impl Led {
-    fn new(number: u8, color: Color) -> Self {
-        Self { number, color }
-    }
-
-    /// The LED's 1-based number.
-    pub fn number(&self) -> u8 {
-        self.number
-    }
-
-    /// The LED's current color.
-    pub fn color(&self) -> Color {
-        self.color
-    }
-
-    /// Add `step` to one channel of the LED's color, clamped to `0..=255`.
-    pub fn nudge(&mut self, channel: Channel, step: i16) {
-        channel.adjust(&mut self.color, step);
-    }
-}
 
 /// The full set of fan LEDs plus the currently selected one.
 ///
-/// The LEDs are numbered 1..=LED_COUNT. By default, color changes target a
-/// single LED at a time; with all-mode on (toggled by the `a` key, off by
-/// default) they target every LED at once. [`LedBank::colors`] yields the whole
-/// set in order for `FanController::write`.
+/// The LEDs are numbered 1..=LED_COUNT. Color changes target the selected
+/// LED, or every LED when all-mode is on; [`colors`](Self::colors) yields the
+/// whole set in order for `FanController::write`.
 #[derive(Debug)]
 pub struct LedBank {
     leds: [Led; LED_COUNT],
     /// 0-based index of the selected LED.
     selected: usize,
-    /// When true, color changes apply to every LED instead of just the
-    /// selected one. Off by default.
     all_mode: bool,
-    /// When true, the colors travel around the ring: the TUI calls
-    /// [`rotate`](Self::rotate) every 1/8 s. Off by default.
     rotation: bool,
-    /// The direction the colors travel while rotating.
     direction: RotationDirection,
 }
 
 impl LedBank {
-    /// Build a bank from explicit per-LED colors (in ring order); LED 1 is
-    /// selected and all-mode is off.
+    /// Build a bank from explicit per-LED colors (in ring order). LED 1 is
+    /// selected; all-mode and rotation start off.
     pub fn from_colors(colors: [Color; LED_COUNT]) -> Self {
-        let leds = std::array::from_fn(|i| Led::new((i + 1) as u8, colors[i]));
+        let leds = std::array::from_fn(|index| Led::new((index + 1) as u8, colors[index]));
         Self {
             leds,
             selected: 0,
@@ -131,75 +33,31 @@ impl LedBank {
     }
 
     /// Build a bank with a rainbow: LED `i` shows hue `i · 360/LED_COUNT`, so
-    /// the 8 LEDs run around the color wheel starting at red (LED 1). LED 1
-    /// is selected and all-mode is off.
+    /// the LEDs run around the color wheel starting at red (LED 1).
     pub fn rainbow() -> Self {
-        let colors = std::array::from_fn(|i| Color::from_hue(360.0 * i as f64 / LED_COUNT as f64));
+        let colors =
+            std::array::from_fn(|index| Color::from_hue(360.0 * index as f64 / LED_COUNT as f64));
         Self::from_colors(colors)
     }
+}
 
-    /// Whether at least one LED is lit (i.e. not [`Color::BLACK`]).
-    pub fn any_lit(&self) -> bool {
-        self.leds.iter().any(|led| led.color != Color::BLACK)
-    }
-
-    /// Whether all-mode is on (color changes apply to every LED).
-    ///
-    /// Off by default; the `a` key toggles it.
-    pub fn all_mode(&self) -> bool {
-        self.all_mode
-    }
-
-    /// Toggle all-mode. Returns the new state (`true` = on).
-    pub fn toggle_all(&mut self) -> bool {
-        self.all_mode = !self.all_mode;
-        self.all_mode
-    }
-
-    /// Whether the colors are rotating around the ring.
-    ///
-    /// Off by default; the `t` key toggles it.
-    pub fn rotation_on(&self) -> bool {
-        self.rotation
-    }
-
-    /// Toggle the rotation. Returns the new state (`true` = on).
-    pub fn toggle_rotation(&mut self) -> bool {
-        self.rotation = !self.rotation;
-        self.rotation
-    }
-
-    /// The direction the colors travel while rotating (clockwise by default).
-    pub fn rotation_direction(&self) -> RotationDirection {
-        self.direction
-    }
-
-    /// Flip the rotation direction (clockwise ↔ counter-clockwise).
-    pub fn flip_direction(&mut self) {
-        self.direction = self.direction.flipped();
-    }
-
-    /// Shift every LED's color one position around the ring in the current
-    /// direction: clockwise, the color of LED `i` moves to the position of
-    /// LED `i - 1` (LED 1's color lands on LED 8); counter-clockwise, LED
-    /// `i`'s color moves to LED `i + 1` (LED 1's color lands on LED 2).
-    pub fn rotate(&mut self) {
-        let colors: [Color; LED_COUNT] = std::array::from_fn(|i| self.leds[i].color);
-        // Clockwise: position `i` receives the color that sat at `i + 1`
-        // (LED 1's color wraps around to LED 8). Counter-clockwise: it
-        // receives the color that sat at `i - 1`.
-        let from = match self.direction {
-            RotationDirection::Clockwise => 1,
-            RotationDirection::CounterClockwise => LED_COUNT - 1,
+impl LedBank {
+    /// Select the LED with the given 1-based number. Returns `true` if it was
+    /// selected; out-of-range numbers select nothing.
+    pub fn select(&mut self, number: u8) -> bool {
+        let Some(index) = self.index_by_number(number) else {
+            return false;
         };
-        for index in 0..LED_COUNT {
-            self.leds[index].color = colors[(index + from) % LED_COUNT];
-        }
+        self.selected = index;
+        true
     }
 
-    /// Iterate the LEDs as `(0-based index, &Led)` in ring order.
-    pub fn indexed(&self) -> impl Iterator<Item = (usize, &Led)> + '_ {
-        self.leds.iter().enumerate()
+    /// Select the LED for a `1`..`8` key press; `0` and `9` select nothing.
+    pub fn select_from_key(&mut self, key: char) -> bool {
+        match key.to_digit(10) {
+            Some(digit) if (1..=LED_COUNT as u32).contains(&digit) => self.select(digit as u8),
+            _ => false,
+        }
     }
 
     /// The 0-based index of the selected LED.
@@ -212,62 +70,93 @@ impl LedBank {
         &self.leds[self.selected]
     }
 
-    /// Select the LED with the given 1-based number.
-    ///
-    /// Returns `true` if `number` is in `1..=LED_COUNT` and was selected.
-    pub fn select(&mut self, number: u8) -> bool {
-        match self.index_by_number(number) {
-            Some(index) => {
-                self.selected = index;
-                true
-            }
-            None => false,
-        }
-    }
-
-    /// Select the LED for a `1`..`8` key press.
-    ///
-    /// Returns `true` if the key selected an LED (i.e. the key was one of
-    /// `1`..`8`); `0` and `9` select nothing.
-    pub fn select_key(&mut self, key: char) -> bool {
-        match key.to_digit(10) {
-            Some(digit) if (1..=LED_COUNT as u32).contains(&digit) => self.select(digit as u8),
-            _ => false,
-        }
-    }
-
-    /// Add `step` to one channel of the color(s): every LED when all-mode is
-    /// on, otherwise just the selected LED.
-    pub fn nudge(&mut self, channel: Channel, step: i16) {
-        if self.all_mode {
-            for led in &mut self.leds {
-                led.nudge(channel, step);
-            }
-        } else {
-            self.leds[self.selected].nudge(channel, step);
-        }
-    }
-
-    /// Set the target LED(s) to `color`: every LED when all-mode is on,
-    /// otherwise just the selected one.
-    pub fn set_color(&mut self, color: Color) {
-        if self.all_mode {
-            for led in &mut self.leds {
-                led.color = color;
-            }
-        } else {
-            self.leds[self.selected].color = color;
-        }
-    }
-
-    /// The colors of all LEDs in ring order, ready for `FanController::write`.
-    pub fn colors(&self) -> Vec<Color> {
-        self.leds.iter().map(|led| led.color).collect()
-    }
-
     fn index_by_number(&self, number: u8) -> Option<usize> {
         let index = number.checked_sub(1)? as usize;
         (index < LED_COUNT).then_some(index)
+    }
+}
+
+impl LedBank {
+    /// Whether all-mode is on: color changes apply to every LED.
+    pub fn all_mode(&self) -> bool {
+        self.all_mode
+    }
+
+    /// Toggle all-mode. Returns the new state.
+    pub fn toggle_all(&mut self) -> bool {
+        self.all_mode = !self.all_mode;
+        self.all_mode
+    }
+
+    /// Add `step` to one channel of the target LED(s).
+    pub fn adjust(&mut self, channel: Channel, step: i16) {
+        self.update_targets(|led| led.adjust(channel, step));
+    }
+
+    /// Set the target LED(s) to `color`.
+    pub fn set_color(&mut self, color: Color) {
+        self.update_targets(|led| led.set_color(color));
+    }
+
+    /// Apply `update` to the target LED(s): every LED when all-mode is on,
+    /// otherwise just the selected one.
+    fn update_targets(&mut self, mut update: impl FnMut(&mut Led)) {
+        if self.all_mode {
+            for led in &mut self.leds {
+                update(led);
+            }
+        } else {
+            update(&mut self.leds[self.selected]);
+        }
+    }
+}
+
+impl LedBank {
+    /// Whether the colors are rotating around the ring.
+    pub fn rotation_on(&self) -> bool {
+        self.rotation
+    }
+
+    /// Toggle the rotation. Returns the new state.
+    pub fn toggle_rotation(&mut self) -> bool {
+        self.rotation = !self.rotation;
+        self.rotation
+    }
+
+    /// The direction the colors travel while rotating (clockwise by default).
+    pub fn rotation_direction(&self) -> RotationDirection {
+        self.direction
+    }
+
+    /// Flip the rotation direction.
+    pub fn flip_direction(&mut self) {
+        self.direction = self.direction.flipped();
+    }
+
+    /// Shift every LED's color one position around the ring, in the current
+    /// direction.
+    pub fn rotate(&mut self) {
+        let previous: [Color; LED_COUNT] = self.leds.map(|led| led.color());
+        for (position, led) in self.leds.iter_mut().enumerate() {
+            led.set_color(previous[self.direction.source_position(position)]);
+        }
+    }
+}
+
+impl LedBank {
+    /// Whether at least one LED is lit (i.e. not black).
+    pub fn any_lit(&self) -> bool {
+        self.leds.iter().any(|led| led.color() != Color::BLACK)
+    }
+
+    /// Iterate the LEDs as `(0-based index, &Led)` in ring order.
+    pub fn indexed(&self) -> impl Iterator<Item = (usize, &Led)> + '_ {
+        self.leds.iter().enumerate()
+    }
+
+    /// The colors of all LEDs in ring order.
+    pub fn colors(&self) -> Vec<Color> {
+        self.leds.iter().map(|led| led.color()).collect()
     }
 }
 
@@ -275,9 +164,16 @@ impl LedBank {
 mod tests {
     use super::*;
 
-    /// A bank with every LED red, as the nudge/color tests below assume.
+    /// A bank with every LED red, as the color-change tests below assume.
     fn red_bank() -> LedBank {
         LedBank::from_colors([Color::new(255, 0, 0); LED_COUNT])
+    }
+
+    /// A bank with a distinct color per LED, so every shift is visible.
+    fn distinct_bank() -> LedBank {
+        LedBank::from_colors(std::array::from_fn(|index| {
+            Color::new((index + 1) as u8, 0, 0)
+        }))
     }
 
     /// The LEDs are numbered 1..=LED_COUNT (i.e. 1 to 8), in ring order.
@@ -288,18 +184,19 @@ mod tests {
         assert_eq!(numbers, (1..=LED_COUNT as u8).collect::<Vec<u8>>());
     }
 
-    /// `select_key` maps `1`..`8` to the matching LED and rejects the rest.
+    /// `select_from_key` maps `1`..`8` to the matching LED and rejects the
+    /// rest.
     #[test]
-    fn select_key_maps_digits_to_leds() {
+    fn select_from_key_maps_digits_to_leds() {
         let mut bank = LedBank::rainbow();
         for expected in 1..=LED_COUNT as u8 {
             let key = char::from_digit(expected as u32, 10).expect("digit");
-            assert!(bank.select_key(key), "key {key} should select");
+            assert!(bank.select_from_key(key), "key {key} should select");
             assert_eq!(bank.selected().number(), expected);
         }
         let before = bank.selected().number();
-        assert!(!bank.select_key('0'), "0 is not a LED key");
-        assert!(!bank.select_key('9'), "9 is not a LED key");
+        assert!(!bank.select_from_key('0'), "0 is not a LED key");
+        assert!(!bank.select_from_key('9'), "9 is not a LED key");
         assert_eq!(bank.selected().number(), before);
     }
 
@@ -313,17 +210,17 @@ mod tests {
         assert_eq!(bank.selected().number(), 8);
     }
 
-    /// With all-mode off (the default), `nudge` changes only the selected LED
-    /// and clamps to 0..=255.
+    /// With all-mode off (the default), `adjust` changes only the selected
+    /// LED and clamps to 0..=255.
     #[test]
-    fn nudge_affects_only_the_selected_led_by_default() {
+    fn adjust_affects_only_the_selected_led_by_default() {
         let mut bank = red_bank();
         assert!(!bank.all_mode(), "all-mode is off by default");
         bank.select(2);
-        bank.nudge(Channel::Green, COLOR_STEP);
+        bank.adjust(Channel::Green, 16);
 
         let colors = bank.colors();
-        assert_eq!(colors[1], Color::new(255, COLOR_STEP as u8, 0));
+        assert_eq!(colors[1], Color::new(255, 16, 0));
         for (index, color) in colors.iter().enumerate() {
             if index != 1 {
                 assert_eq!(
@@ -334,25 +231,25 @@ mod tests {
             }
         }
 
-        // Repeatedly nudging red past the top clamps it at 255.
+        // Repeatedly adjusting red past the top clamps it at 255.
         for _ in 0..20 {
-            bank.nudge(Channel::Red, COLOR_STEP);
+            bank.adjust(Channel::Red, 16);
         }
         assert_eq!(bank.colors()[1].r, 255);
     }
 
-    /// With all-mode on, `nudge` shifts every LED by the same step.
+    /// With all-mode on, `adjust` shifts every LED by the same step.
     #[test]
-    fn nudge_affects_all_leds_in_all_mode() {
+    fn adjust_affects_all_leds_in_all_mode() {
         let mut bank = red_bank();
         bank.toggle_all();
         assert!(bank.all_mode());
-        bank.nudge(Channel::Blue, COLOR_STEP);
+        bank.adjust(Channel::Blue, 16);
 
         for (index, color) in bank.colors().iter().enumerate() {
             assert_eq!(
                 *color,
-                Color::new(255, 0, COLOR_STEP as u8),
+                Color::new(255, 0, 16),
                 "LED {index} should have shifted blue"
             );
         }
@@ -401,11 +298,6 @@ mod tests {
         assert!(!bank.all_mode());
     }
 
-    /// A bank with a distinct color per LED, so every shift is visible.
-    fn distinct_bank() -> LedBank {
-        LedBank::from_colors(std::array::from_fn(|i| Color::new((i + 1) as u8, 0, 0)))
-    }
-
     /// The rotation starts off, travelling clockwise.
     #[test]
     fn rotation_starts_off_and_clockwise() {
@@ -442,14 +334,14 @@ mod tests {
         assert_eq!(bank.rotation_direction(), RotationDirection::Clockwise);
     }
 
-    /// Clockwise: LED 1's color lands on LED 8, LED 2's on LED 1, and so on
-    /// (each color moves to the previous LED's position).
+    /// Clockwise: each color moves to the previous LED's position (LED 1's
+    /// wraps around to LED 8).
     #[test]
     fn rotate_clockwise_moves_every_color_to_the_previous_position() {
         let mut bank = distinct_bank();
         bank.rotate();
 
-        let reds: Vec<u8> = bank.colors().iter().map(|c| c.r).collect();
+        let reds: Vec<u8> = bank.colors().iter().map(|color| color.r).collect();
         assert_eq!(
             reds,
             vec![2, 3, 4, 5, 6, 7, 8, 1],
@@ -458,15 +350,15 @@ mod tests {
         );
     }
 
-    /// Counter-clockwise: LED 1's color lands on LED 2, LED 2's on LED 3,
-    /// and so on (each color moves to the next LED's position).
+    /// Counter-clockwise: each color moves to the next LED's position (LED
+    /// 8's wraps around to LED 1).
     #[test]
     fn rotate_counter_clockwise_moves_every_color_to_the_next_position() {
         let mut bank = distinct_bank();
         bank.flip_direction();
         bank.rotate();
 
-        let reds: Vec<u8> = bank.colors().iter().map(|c| c.r).collect();
+        let reds: Vec<u8> = bank.colors().iter().map(|color| color.r).collect();
         assert_eq!(
             reds,
             vec![8, 1, 2, 3, 4, 5, 6, 7],
@@ -503,12 +395,12 @@ mod tests {
     fn colors_returns_one_per_led_in_order() {
         let mut bank = red_bank();
         bank.select(3);
-        bank.nudge(Channel::Blue, COLOR_STEP);
+        bank.adjust(Channel::Blue, 16);
 
         let colors = bank.colors();
         assert_eq!(colors.len(), LED_COUNT);
         // Only LED 3 (index 2) changed; the rest stay the initial red.
-        assert_eq!(colors[2], Color::new(255, 0, COLOR_STEP as u8));
+        assert_eq!(colors[2], Color::new(255, 0, 16));
         for (index, color) in colors.iter().enumerate() {
             if index != 2 {
                 assert_eq!(
@@ -518,18 +410,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// `Led::nudge` clamps a channel to the `0..=255` byte range.
-    #[test]
-    fn nudge_clamps_to_byte_range() {
-        let mut led = Led::new(1, Color::new(255, 0, 128));
-        led.nudge(Channel::Red, COLOR_STEP); // 255 + 16 would exceed: clamps to 255
-        assert_eq!(led.color().r, 255);
-        led.nudge(Channel::Green, -COLOR_STEP); // 0 - 16 would go below 0: clamps to 0
-        assert_eq!(led.color().g, 0);
-        led.nudge(Channel::Blue, -2 * COLOR_STEP); // 128 - 32 = 96 (in range, no clamp)
-        assert_eq!(led.color().b, 96);
     }
 
     /// The rainbow spreads one hue per LED around the wheel: LED 1 starts at
@@ -547,12 +427,12 @@ mod tests {
         assert_eq!(
             colors[LED_COUNT / 2],
             Color::new(0, 255, 255),
-            "LED {half} is half a turn away (cyan)",
-            half = LED_COUNT / 2 + 1
+            "LED {} is half a turn away (cyan)",
+            LED_COUNT / 2 + 1
         );
-        for (i, a) in colors.iter().enumerate() {
-            for b in colors.iter().skip(i + 1) {
-                assert_ne!(a, b, "no two LEDs should share a hue");
+        for (index, color) in colors.iter().enumerate() {
+            for other in colors.iter().skip(index + 1) {
+                assert_ne!(color, other, "no two LEDs should share a hue");
             }
         }
         assert!(bank.any_lit(), "a rainbow has every LED lit");

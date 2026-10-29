@@ -295,7 +295,7 @@ impl App {
             // does not change the fan, so no write is needed. It re-points the
             // hue slider at the newly selected LED's hue.
             KeyCode::Char(c @ '1'..='8') => {
-                self.leds.select_key(c);
+                self.leds.select_from_key(c);
                 self.sync_slider();
                 return true;
             }
@@ -330,12 +330,12 @@ impl App {
                 return true;
             }
             KeyCode::Char('x') => return self.toggle_auto(fan),
-            KeyCode::Char('r') => self.leds.nudge(Channel::Red, COLOR_STEP),
-            KeyCode::Char('R') => self.leds.nudge(Channel::Red, -COLOR_STEP),
-            KeyCode::Char('g') => self.leds.nudge(Channel::Green, COLOR_STEP),
-            KeyCode::Char('G') => self.leds.nudge(Channel::Green, -COLOR_STEP),
-            KeyCode::Char('b') => self.leds.nudge(Channel::Blue, COLOR_STEP),
-            KeyCode::Char('B') => self.leds.nudge(Channel::Blue, -COLOR_STEP),
+            KeyCode::Char('r') => self.leds.adjust(Channel::Red, COLOR_STEP),
+            KeyCode::Char('R') => self.leds.adjust(Channel::Red, -COLOR_STEP),
+            KeyCode::Char('g') => self.leds.adjust(Channel::Green, COLOR_STEP),
+            KeyCode::Char('G') => self.leds.adjust(Channel::Green, -COLOR_STEP),
+            KeyCode::Char('b') => self.leds.adjust(Channel::Blue, COLOR_STEP),
+            KeyCode::Char('B') => self.leds.adjust(Channel::Blue, -COLOR_STEP),
             _ => return true,
         }
         self.apply(fan);
@@ -1003,8 +1003,8 @@ mod tests {
         let mut leds = red_bank();
         // Turn LED 2 from red to blue; LED 1 stays red (all-mode is off).
         leds.select(2);
-        leds.nudge(Channel::Red, -255);
-        leds.nudge(Channel::Blue, 255);
+        leds.adjust(Channel::Red, -255);
+        leds.adjust(Channel::Blue, 255);
 
         let app = App::new(leds);
         let mut terminal =
