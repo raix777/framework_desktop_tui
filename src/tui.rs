@@ -18,18 +18,22 @@
 //! - `t` — toggle the rotation: while on, the colors shift one position
 //!   around the ring every 1/8 s (LED 1's color moves to LED 8, and so on)
 //! - `s` — flip the rotation direction (clockwise ↔ counter-clockwise)
-//! - `Up` / `Down` — increase / decrease the fan speed by 3% (a vertical bar
-//!   to the left of the ring shows the speed in percent); while the EC's
-//!   automatic fan control is on, the value is stored and written when the
-//!   control is switched off
-//! - `x` — toggle the EC's automatic fan control
+//! - `Up` / `Down` — a vertical bar to the left of the ring shows the speed
+//!   in percent; while the app controls the speed they change it by 3%, and
+//!   while it does not (disabled at startup, or the EC's automatic control)
+//!   they take manual control and jump to the high speed (`Up`) or the low
+//!   speed (`Down`)
+//! - `x` — take the fan out of the EC's control (start manual control at 50%),
+//!   then toggle the EC's automatic fan control on and off
 //! - `q` or `Esc` — quit
 //!
 //! On start the app restores the colors it set last time, so it never
 //! overwrites a lit fan; when every LED is off it lights the fan with a
 //! rainbow. The EC cannot report the current colors, so the app keeps them in
 //! a state file (see [`crate::state`]). The fan speed cannot be read back
-//! either, so it starts at 50% under manual control.
+//! either, so it is left untouched at startup (the speed bar is not shown
+//! until the user takes over) and the first speed key takes the fan under
+//! manual control.
 
 use std::io::{self, Stdout};
 use std::time::{Duration, Instant};
@@ -49,7 +53,7 @@ use ratatui::{Frame, Terminal};
 use ratatui::widgets::canvas::{Canvas, Circle, Context, Points};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use crate::fan::{Color, FanController, LED_COUNT, SPEED_STEP, SpeedControl};
+use crate::fan::{Color, FanController, LED_COUNT, SPEED_STEP, SpeedControl, SpeedState};
 use crate::led::{Channel, LedBank, RotationDirection, COLOR_STEP};
 use crate::state;
 
@@ -163,24 +167,26 @@ impl App {
         self.error = fan.enable_auto_control().err().map(|err| err.to_string());
     }
 
-    /// Handle an arrow key: move the speed by `step` and write it to the fan
-    /// when it changed and the automatic control is off (in auto mode the EC
-    /// owns the speed, so the value is only stored).
+    /// Handle an arrow key: move the speed and write it to the fan when the
+    /// app must reflect the change (starting manual control, or moving the
+    /// manual speed). While the EC's automatic control is on the value is
+    /// only stored, because the EC owns the live speed.
     fn nudge_speed<F: FanController>(&mut self, step: i8, fan: &F) -> bool {
-        if self.speed.nudge(step) && !self.speed.auto_control() {
+        if self.speed.nudge(step) {
             self.apply_speed(fan);
         }
         true
     }
 
-    /// Handle `x`: toggle the EC's automatic fan control. Turning it on hands
-    /// the speed to the EC; turning it off re-asserts the stored speed, which
-    /// takes the fan out of the EC's control.
+    /// Handle `x`: from the disabled state the first press takes the fan out
+    /// of the EC's control at the neutral speed; afterwards it toggles the
+    /// EC's automatic fan control, handing the speed to the EC or re-asserting
+    /// the stored speed.
     fn toggle_auto<F: FanController>(&mut self, fan: &F) -> bool {
-        if self.speed.toggle_auto_control() {
-            self.apply_auto_control(fan);
-        } else {
-            self.apply_speed(fan);
+        match self.speed.toggle() {
+            SpeedState::Auto => self.apply_auto_control(fan),
+            // Manual (just started or resumed) re-asserts the stored speed.
+            SpeedState::Manual | SpeedState::Disabled => self.apply_speed(fan),
         }
         true
     }
@@ -413,9 +419,18 @@ fn draw_fan(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 /// The speed bar: a vertical meter filling from the bottom in proportion to
-/// the speed, with the speed in percent (or "auto" while the EC's automatic
-/// control is on) as the label below.
+/// the speed, with the speed in percent (or "auto") as the label below. The
+/// bar is live green while the app controls the speed, and dimmed "auto"
+/// while the EC's automatic control is on. Before the app has taken control
+/// (the disabled startup state) there is no speed to show, so the bar is not
+/// drawn at all.
 fn draw_speed_bar(frame: &mut Frame, app: &App, area: Rect) {
+    // The EC's fan control is left alone until the user takes over, so there
+    // is no speed to display yet: draw nothing.
+    if app.speed.state() == SpeedState::Disabled {
+        return;
+    }
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -425,10 +440,12 @@ fn draw_speed_bar(frame: &mut Frame, app: &App, area: Rect) {
         .split(area);
 
     let percent = app.speed.percent();
-    let auto = app.speed.auto_control();
-    // In auto mode the EC decides the speed, so the stored value is shown
-    // dimmed instead of the live green.
-    let live = if auto { RColor::DarkGray } else { RColor::Green };
+    // Manual: a live green fill. Auto: dimmed, no fill (the EC owns the
+    // speed); the disabled state returns above.
+    let bar = match app.speed.state() {
+        SpeedState::Manual => RColor::Green,
+        SpeedState::Auto | SpeedState::Disabled => RColor::DarkGray,
+    };
 
     let block = Block::default().borders(Borders::ALL);
     frame.render_widget(&block, chunks[0]);
@@ -438,20 +455,19 @@ fn draw_speed_bar(frame: &mut Frame, app: &App, area: Rect) {
     let lines = (0..height)
         .map(|row| {
             let lit = row >= height - filled;
-            let fg = if lit { live } else { RColor::DarkGray };
+            let fg = if lit { bar } else { RColor::DarkGray };
             Line::from(Span::styled("██", Style::default().fg(fg)))
         })
         .collect::<Vec<Line>>();
     frame.render_widget(Paragraph::new(lines), inner);
 
-    let label = if auto {
-        "auto".to_string()
-    } else {
-        format!("{percent}%")
+    let label = match app.speed.state() {
+        SpeedState::Auto => "auto".to_string(),
+        _ => format!("{percent}%"),
     };
     let label = Line::from(Span::styled(
         label,
-        Style::default().fg(live).add_modifier(Modifier::BOLD),
+        Style::default().fg(bar).add_modifier(Modifier::BOLD),
     ));
     frame.render_widget(Paragraph::new(label).alignment(Alignment::Center), chunks[1]);
 }
@@ -618,6 +634,7 @@ fn footer(app: &App) -> Paragraph<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fan::{HIGH_SPEED, LOW_SPEED};
     use ratatui::backend::TestBackend;
 
     /// A bank with every LED red, as the frame tests below assume.
@@ -969,13 +986,16 @@ mod tests {
         assert_eq!(colors[0], Color::new(2, 0, 0), "LED 2's color lands on LED 1");
     }
 
-    /// An app with a red bank whose speed is `percent` (manual mode).
+    /// An app with a red bank in manual control at `percent`.
     fn app_with_speed(percent: u8) -> App {
         let mut app = App {
             leds: red_bank(),
             speed: SpeedControl::new(),
             error: None,
         };
+        // Take the fan under manual control first (the neutral speed), then
+        // step the stored speed to the target.
+        let _ = app.speed.toggle();
         while app.speed.percent() != percent {
             let step = if app.speed.percent() < percent { 1 } else { -1 };
             assert!(app.speed.nudge(step), "the speed steps toward {percent}");
@@ -983,16 +1003,43 @@ mod tests {
         app
     }
 
-    /// `Up`/`Down` move the speed by 3% and write it to the fan, without
-    /// touching the LEDs or the auto control.
+    /// From the disabled state the first `Up` is a shortcut: it takes manual
+    /// control and jumps to the high speed (75%), and the next `Down` fine-
+    /// tunes the manual speed back down by 3% (72%).
     #[test]
-    fn arrow_keys_change_the_speed_and_write_the_fan() {
+    fn first_arrow_key_jumps_to_the_high_speed() {
         let fan = CountingFan::default();
         let mut app = App {
             leds: red_bank(),
             speed: SpeedControl::new(),
             error: None,
         };
+
+        assert!(app.handle_key(KeyCode::Up, &fan), "Up keeps the app running");
+        assert_eq!(app.speed.state(), SpeedState::Manual, "Up takes manual control");
+        assert_eq!(app.speed.percent(), HIGH_SPEED, "the first Up jumps to the high speed");
+        assert!(app.handle_key(KeyCode::Down, &fan), "Down keeps the app running");
+        assert_eq!(app.speed.percent(), HIGH_SPEED - 3, "Down then fine-tunes the manual speed");
+
+        assert_eq!(
+            fan.speeds.borrow().as_slice(),
+            &[75, 72],
+            "each change writes the new speed to the fan"
+        );
+        assert_eq!(fan.writes.get(), 0, "the speed keys do not write the LEDs");
+        assert_eq!(
+            fan.auto_enables.get(),
+            0,
+            "the speed keys do not touch the auto control"
+        );
+    }
+
+    /// In manual mode `Up`/`Down` move the speed by 3% and write it to the
+    /// fan, without touching the LEDs or the auto control.
+    #[test]
+    fn arrow_keys_change_the_speed_and_write_the_fan() {
+        let fan = CountingFan::default();
+        let mut app = app_with_speed(50);
 
         assert!(app.handle_key(KeyCode::Up, &fan), "Up keeps the app running");
         assert_eq!(app.speed.percent(), 53, "Up raises the speed by 3%");
@@ -1043,7 +1090,7 @@ mod tests {
         let mut app = app_with_speed(67);
 
         assert!(app.handle_key(KeyCode::Char('x'), &fan), "x keeps the app running");
-        assert!(app.speed.auto_control(), "x turns the auto control on");
+        assert_eq!(app.speed.state(), SpeedState::Auto, "x turns the auto control on");
         assert_eq!(
             fan.auto_enables.get(),
             1,
@@ -1055,7 +1102,11 @@ mod tests {
         );
 
         assert!(app.handle_key(KeyCode::Char('x'), &fan));
-        assert!(!app.speed.auto_control(), "the second x turns it off again");
+        assert_eq!(
+            app.speed.state(),
+            SpeedState::Manual,
+            "the second x turns it off again"
+        );
         assert_eq!(
             fan.speeds.borrow().as_slice(),
             &[67],
@@ -1063,23 +1114,55 @@ mod tests {
         );
     }
 
-    /// In auto mode the arrow keys still move the stored speed, but the fan
-    /// is not written (the EC owns the speed).
+    /// While the EC's automatic control is on, an arrow key is a shortcut: it
+    /// takes manual control, jumping to the high speed (`Up`) or the low speed
+    /// (`Down`), and writes it to the fan (overriding the auto control).
     #[test]
-    fn arrow_keys_store_the_speed_without_writing_in_auto_mode() {
-        let fan = CountingFan::default();
-        let mut app = App {
+    fn arrow_keys_jump_to_high_or_low_speed_from_auto() {
+        for (key, expected) in [(KeyCode::Up, HIGH_SPEED), (KeyCode::Down, LOW_SPEED)] {
+            let fan = CountingFan::default();
+            let mut app = app_with_speed(67);
+            // Hand the speed to the EC: manual -> auto.
+            app.handle_key(KeyCode::Char('x'), &fan);
+            assert_eq!(app.speed.state(), SpeedState::Auto, "x switches to the auto control");
+
+            assert!(app.handle_key(key, &fan), "the arrow keeps the app running");
+            assert_eq!(app.speed.state(), SpeedState::Manual, "the arrow takes manual control");
+            assert_eq!(app.speed.percent(), expected, "the arrow jumps to the target speed");
+            assert_eq!(
+                fan.speeds.borrow().as_slice(),
+                &[expected],
+                "the jump overrides the auto control"
+            );
+        }
+    }
+
+    /// At startup the speed control is disabled: the fan is left untouched and
+    /// there is no speed to show, so the bar is not drawn at all (no fill, no
+    /// percent label).
+    #[test]
+    fn speed_bar_is_not_drawn_while_disabled() {
+        let app = App {
             leds: red_bank(),
             speed: SpeedControl::new(),
             error: None,
         };
-        app.handle_key(KeyCode::Char('x'), &fan);
+        assert_eq!(app.speed.state(), SpeedState::Disabled, "the fan starts disabled");
 
-        assert!(app.handle_key(KeyCode::Up, &fan));
-        assert_eq!(app.speed.percent(), 53, "the stored speed still moves");
+        let mut terminal = Terminal::new(TestBackend::new(80, 24))
+            .expect("test backend should initialize");
+        terminal
+            .draw(|frame| draw(frame, &app))
+            .expect("draw should not fail");
+
+        let content = terminal.backend().buffer().content();
         assert!(
-            fan.speeds.borrow().is_empty(),
-            "no speed write while auto is on"
+            !content.iter().any(|cell| cell.symbol() == "%"),
+            "the disabled bar shows no percent label"
+        );
+        assert!(
+            !content.iter().any(|cell| cell.symbol() == "█"),
+            "the disabled bar draws no fill"
         );
     }
 
@@ -1133,7 +1216,7 @@ mod tests {
         assert!(labeled, "manual mode is labeled with the speed in percent");
 
         let mut auto_app = app_with_speed(50);
-        auto_app.speed.toggle_auto_control();
+        let _ = auto_app.speed.toggle();
         terminal
             .draw(|frame| draw(frame, &auto_app))
             .expect("draw should not fail");

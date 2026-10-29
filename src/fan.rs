@@ -59,31 +59,55 @@ impl Color {
     }
 }
 
-/// The manual fan speed the app starts at: half speed.
+/// The neutral fan speed the app assumes before it has controlled the fan:
+/// half speed, what `x` resumes to when taking manual control from the
+/// disabled state.
 pub const DEFAULT_SPEED: u8 = 50;
 
-/// The step the arrow keys apply to the fan speed, in percent.
+/// The step the arrow keys apply to the fan speed while it is under manual
+/// control, in percent.
 pub const SPEED_STEP: i8 = 3;
 
-/// The fan's speed: the manual speed in percent, and whether the EC's
-/// automatic fan control is active.
+/// The speed `Up` jumps to when it takes manual control from a state the app
+/// does not control (disabled or the EC's automatic control).
+pub const HIGH_SPEED: u8 = 75;
+
+/// The speed `Down` jumps to when it takes manual control from a state the
+/// app does not control (disabled or the EC's automatic control).
+pub const LOW_SPEED: u8 = 25;
+
+/// Who decides the fan's speed: no one yet (the EC is left alone), the app at
+/// a fixed speed, or the EC's automatic fan control.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpeedState {
+    /// The app has not asserted any fan speed control: whatever the EC was
+    /// doing at startup is left untouched.
+    Disabled,
+    /// The app sets the fan speed to a fixed value.
+    Manual,
+    /// The EC's automatic fan control decides the speed.
+    Auto,
+}
+
+/// The fan's speed: the manual speed in percent, and who controls the fan.
 ///
-/// While the automatic control is on, the EC decides the fan's speed;
-/// `percent` is what the fan will run at when the control is switched off.
+/// While the control is `Disabled` or `Auto`, the EC owns the speed; `percent`
+/// is the value the app runs the fan at under manual control.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpeedControl {
     /// Manual fan speed in percent (`0..=100`).
     percent: u8,
-    /// Whether the EC's automatic fan control is active.
-    auto: bool,
+    /// Who decides the fan's speed.
+    state: SpeedState,
 }
 
 impl SpeedControl {
-    /// The startup state: manual control at [`DEFAULT_SPEED`].
+    /// The startup state: the fan is left untouched (disabled) at the neutral
+    /// [`DEFAULT_SPEED`].
     pub fn new() -> Self {
         Self {
             percent: DEFAULT_SPEED,
-            auto: false,
+            state: SpeedState::Disabled,
         }
     }
 
@@ -92,26 +116,55 @@ impl SpeedControl {
         self.percent
     }
 
-    /// Whether the EC's automatic fan control is active.
-    pub fn auto_control(&self) -> bool {
-        self.auto
+    /// Who decides the fan's speed.
+    pub fn state(&self) -> SpeedState {
+        self.state
     }
 
-    /// Change the speed by `step` percent, clamped to `0..=100`.
+    /// Move the speed with an arrow key.
+    ///
+    /// While the app does not control the speed (`Disabled` or `Auto`), the
+    /// key is a shortcut: it takes manual control and jumps straight to
+    /// [`HIGH_SPEED`] (`Up`) or [`LOW_SPEED`] (`Down`). While the app does
+    /// control it (`Manual`), it moves the speed by `step` ([`SPEED_STEP`]),
+    /// clamped to `0..=100`.
+    ///
+    /// Returns whether the fan must be (re)written: always for the shortcut,
+    /// and for a manual move only when the speed actually changed (a clamped
+    /// nudge at the 0% or 100% end does not).
+    pub fn nudge(&mut self, step: i8) -> bool {
+        match self.state {
+            // Take over and jump to the high or low speed.
+            SpeedState::Disabled | SpeedState::Auto => {
+                self.percent = if step > 0 { HIGH_SPEED } else { LOW_SPEED };
+                self.state = SpeedState::Manual;
+                true
+            }
+            // Fine-tune the speed under manual control.
+            SpeedState::Manual => self.move_percent(i16::from(step)),
+        }
+    }
+
+    /// Handle `x`: from `Disabled` the first press starts manual control at
+    /// the stored (neutral) speed; afterwards it toggles between `Manual` (the
+    /// app sets the stored speed) and `Auto` (the EC decides the speed).
+    /// Returns the new state.
+    pub fn toggle(&mut self) -> SpeedState {
+        self.state = match self.state {
+            SpeedState::Disabled | SpeedState::Auto => SpeedState::Manual,
+            SpeedState::Manual => SpeedState::Auto,
+        };
+        self.state
+    }
+
+    /// Move the stored speed by `delta` percent, clamped to `0..=100`.
     ///
     /// Returns whether the speed changed (it does not at the clamped ends).
-    pub fn nudge(&mut self, step: i8) -> bool {
-        let next = (i16::from(self.percent) + i16::from(step)).clamp(0, 100) as u8;
+    fn move_percent(&mut self, delta: i16) -> bool {
+        let next = (i16::from(self.percent) + delta).clamp(0, 100) as u8;
         let changed = next != self.percent;
         self.percent = next;
         changed
-    }
-
-    /// Toggle the EC's automatic fan control. Returns the new state
-    /// (`true` = on).
-    pub fn toggle_auto_control(&mut self) -> bool {
-        self.auto = !self.auto;
-        self.auto
     }
 }
 
@@ -240,22 +293,55 @@ mod tests {
         }
     }
 
-    /// The speed control starts in manual mode at the default speed.
+    /// The speed control starts disabled: the fan is left untouched, the bar
+    /// shows the neutral speed, and the EC's auto control is not active.
     #[test]
-    fn speed_control_starts_manual_at_the_default_speed() {
+    fn speed_control_starts_disabled() {
         let control = SpeedControl::new();
-        assert!(!control.auto_control(), "manual control is the startup state");
+        assert_eq!(
+            control.state(),
+            SpeedState::Disabled,
+            "the fan is left untouched at startup"
+        );
         assert_eq!(control.percent(), DEFAULT_SPEED);
     }
 
-    /// `nudge` moves the speed by the given step in both directions.
+    /// `nudge` moves the manual speed by the given step in both directions.
     #[test]
     fn speed_nudge_moves_by_the_given_step() {
         let mut control = SpeedControl::new();
+        control.toggle(); // start manual control at the neutral speed
         assert!(control.nudge(SPEED_STEP), "a nudge in range changes the speed");
         assert_eq!(control.percent(), 53);
         assert!(control.nudge(-SPEED_STEP));
         assert_eq!(control.percent(), 50);
+    }
+
+    /// While the app does not control the speed (disabled or the EC's
+    /// automatic control), an arrow key is a shortcut: it takes manual control
+    /// and jumps to the high speed (`Up`) or the low speed (`Down`).
+    #[test]
+    fn speed_nudge_jumps_to_high_or_low_when_not_manual() {
+        // From the disabled startup state.
+        let mut up = SpeedControl::new();
+        assert!(up.nudge(SPEED_STEP), "the press takes manual control");
+        assert_eq!(up.state(), SpeedState::Manual);
+        assert_eq!(up.percent(), HIGH_SPEED, "up jumps to the high speed");
+
+        let mut down = SpeedControl::new();
+        assert!(down.nudge(-SPEED_STEP));
+        assert_eq!(down.state(), SpeedState::Manual);
+        assert_eq!(down.percent(), LOW_SPEED, "down jumps to the low speed");
+
+        // From the auto control, even at a different stored speed.
+        let mut auto = SpeedControl::new();
+        auto.toggle(); // disabled -> manual
+        auto.percent = 67; // some other stored speed
+        auto.toggle(); // manual -> auto
+        assert_eq!(auto.state(), SpeedState::Auto);
+        assert!(auto.nudge(SPEED_STEP));
+        assert_eq!(auto.state(), SpeedState::Manual);
+        assert_eq!(auto.percent(), HIGH_SPEED, "up from auto jumps to the high speed");
     }
 
     /// `nudge` clamps the speed to `0..=100` and reports when it stops
@@ -278,13 +364,25 @@ mod tests {
         assert_eq!(control.percent(), 0);
     }
 
-    /// `toggle_auto_control` flips the automatic control, which starts off.
+    /// `toggle` cycles the control: the first `x` starts manual control, the
+    /// next hands the speed to the EC (auto), and the next takes it back.
     #[test]
-    fn toggle_auto_control_flips_the_state() {
+    fn toggle_cycles_disabled_manual_auto() {
         let mut control = SpeedControl::new();
-        assert!(control.toggle_auto_control(), "the first toggle turns it on");
-        assert!(control.auto_control());
-        assert!(!control.toggle_auto_control(), "the second toggle turns it off");
-        assert!(!control.auto_control());
+        assert_eq!(
+            control.toggle(),
+            SpeedState::Manual,
+            "the first x starts manual control"
+        );
+        assert_eq!(
+            control.toggle(),
+            SpeedState::Auto,
+            "the next x hands the speed to the EC"
+        );
+        assert_eq!(
+            control.toggle(),
+            SpeedState::Manual,
+            "the next x takes the speed back at the stored speed"
+        );
     }
 }
