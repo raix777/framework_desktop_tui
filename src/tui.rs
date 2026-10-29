@@ -37,7 +37,7 @@
 //!
 //! To the right of the ring, a "Thermal" panel shows the EC's temperature
 //! sensors and fan speeds (the same data `framework_tool --thermal` prints),
-//! refreshed every 10 s.
+//! refreshed every 10 s — a label on the panel's frame states that interval.
 //!
 //! On start the app restores the colors it set last time, so it never
 //! overwrites a lit fan; when every LED is off it lights the fan with a
@@ -639,10 +639,18 @@ fn draw_speed_bar(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 /// The thermal panel: the present temperature sensors and the fans, each with
-/// its current reading, refreshed every [`THERMAL_INTERVAL`]. Before the first
-/// successful read there is nothing to show but the (empty) frame.
+/// its current reading, refreshed every [`THERMAL_INTERVAL`]. The frame carries
+/// a right-aligned label stating that interval, so the reader knows the
+/// readings are not live. Before the first successful read there is nothing to
+/// show but the (empty) frame and its label.
 fn draw_thermal(frame: &mut Frame, app: &App, area: Rect) {
-    let block = Block::default().borders(Borders::ALL).title(" Thermal ");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Thermal ")
+        .title(
+            Line::from(format!(" updated every {}s", THERMAL_INTERVAL.as_secs()))
+                .alignment(Alignment::Right),
+        );
     frame.render_widget(Paragraph::new(thermal_lines(app)).block(block), area);
 }
 
@@ -1690,6 +1698,40 @@ mod tests {
         );
         assert!(text.contains("45 C"), "the temperature reading is shown");
         assert!(text.contains("2500 RPM"), "the fan speed is shown");
+    }
+
+    /// The thermal panel's header carries a right-aligned label stating how
+    /// often the stats refresh, so the reader knows the readings are not live.
+    #[test]
+    fn draw_shows_the_thermal_update_interval() {
+        let app = App::new(red_bank());
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("test backend");
+        terminal
+            .draw(|frame| draw(frame, &app))
+            .expect("draw should not fail");
+
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<String> = (0..buffer.area().height)
+            .map(|y| {
+                (0..buffer.area().width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect()
+            })
+            .collect();
+
+        let header = rows
+            .iter()
+            .find(|row| row.contains(" Thermal "))
+            .expect("the panel's title row");
+        let label = "updated every 10s";
+        let start = header
+            .find(label)
+            .expect("the header states the stats are refreshed every 10s");
+        let after = &header[start + label.len()..];
+        assert!(
+            after.trim_end() == "┐",
+            "the label sits at the right end of the header, next to the corner: {header:?}"
+        );
     }
 
     /// One key press moves the cursor by exactly 1° of hue, so the color
