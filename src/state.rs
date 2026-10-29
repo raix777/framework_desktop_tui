@@ -93,8 +93,10 @@ mod tests {
 
     /// A unique temp file per test (tests run in parallel).
     fn temp_path(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir()
-            .join(format!("framework_desktop_tui_state_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "framework_desktop_tui_state_{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).expect("temp dir should be created");
         dir.join(name)
     }

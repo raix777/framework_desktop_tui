@@ -134,9 +134,7 @@ impl LedBank {
     /// the 8 LEDs run around the color wheel starting at red (LED 1). LED 1
     /// is selected and all-mode is off.
     pub fn rainbow() -> Self {
-        let colors = std::array::from_fn(|i| {
-            Color::from_hue(360.0 * i as f64 / LED_COUNT as f64)
-        });
+        let colors = std::array::from_fn(|i| Color::from_hue(360.0 * i as f64 / LED_COUNT as f64));
         Self::from_colors(colors)
     }
 
@@ -316,7 +314,11 @@ mod tests {
         assert_eq!(colors[1], Color::new(255, COLOR_STEP as u8, 0));
         for (index, color) in colors.iter().enumerate() {
             if index != 1 {
-                assert_eq!(*color, Color::new(255, 0, 0), "LED {index} should be untouched");
+                assert_eq!(
+                    *color,
+                    Color::new(255, 0, 0),
+                    "LED {index} should be untouched"
+                );
             }
         }
 
@@ -465,7 +467,11 @@ mod tests {
         assert_eq!(colors[2], Color::new(255, 0, COLOR_STEP as u8));
         for (index, color) in colors.iter().enumerate() {
             if index != 2 {
-                assert_eq!(*color, Color::new(255, 0, 0), "LED {index} should be untouched");
+                assert_eq!(
+                    *color,
+                    Color::new(255, 0, 0),
+                    "LED {index} should be untouched"
+                );
             }
         }
     }
@@ -489,7 +495,11 @@ mod tests {
         let bank = LedBank::rainbow();
         let colors = bank.colors();
         assert_eq!(colors.len(), LED_COUNT);
-        assert_eq!(colors[0], Color::new(255, 0, 0), "LED 1 starts at red (hue 0)");
+        assert_eq!(
+            colors[0],
+            Color::new(255, 0, 0),
+            "LED 1 starts at red (hue 0)"
+        );
         assert_eq!(
             colors[LED_COUNT / 2],
             Color::new(0, 255, 255),

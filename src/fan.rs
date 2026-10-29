@@ -168,6 +168,91 @@ impl SpeedControl {
     }
 }
 
+/// A temperature sensor's current reading.
+///
+/// Only sensors that report a valid temperature make it here; the ones the EC
+/// reports as not present (or uncalibrated) are filtered out by the controller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TempReading {
+    /// The sensor's name as reported by the EC (e.g. "APU", "Fan").
+    name: String,
+    /// The current temperature in degrees Celsius.
+    celsius: u8,
+}
+
+impl TempReading {
+    /// Build a reading from a sensor name and its temperature in degrees Celsius.
+    pub fn new(name: String, celsius: u8) -> Self {
+        Self { name, celsius }
+    }
+
+    /// The sensor's name as reported by the EC.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The current temperature in degrees Celsius.
+    pub fn celsius(&self) -> u8 {
+        self.celsius
+    }
+}
+
+/// A fan's current speed reading.
+///
+/// Only fans that report a real speed make it here; an empty slot (no fan) or
+/// a stalled fan is filtered out by the controller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FanReading {
+    /// The fan's name as reported by the EC (e.g. "APU Fan", "Front Fan").
+    name: String,
+    /// The current speed in revolutions per minute.
+    rpm: u16,
+}
+
+impl FanReading {
+    /// Build a reading from a fan name and its speed in revolutions per minute.
+    pub fn new(name: String, rpm: u16) -> Self {
+        Self { name, rpm }
+    }
+
+    /// The fan's name as reported by the EC.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The current speed in revolutions per minute.
+    pub fn rpm(&self) -> u16 {
+        self.rpm
+    }
+}
+
+/// A snapshot of the EC's thermal data: the present temperature sensors and the
+/// fans, each with its current reading.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Thermal {
+    /// The present temperature sensors and their current readings.
+    sensors: Vec<TempReading>,
+    /// The fans and their current speeds.
+    fans: Vec<FanReading>,
+}
+
+impl Thermal {
+    /// Build a snapshot from the present sensors and fans.
+    pub fn new(sensors: Vec<TempReading>, fans: Vec<FanReading>) -> Self {
+        Self { sensors, fans }
+    }
+
+    /// The present temperature sensors and their current readings.
+    pub fn sensors(&self) -> &[TempReading] {
+        &self.sensors
+    }
+
+    /// The fans and their current speeds.
+    pub fn fans(&self) -> &[FanReading] {
+        &self.fans
+    }
+}
+
 /// Errors that can occur while controlling the fan.
 #[derive(Debug)]
 pub enum FanError {
@@ -207,6 +292,10 @@ pub trait FanController {
     /// Hands the fan speed over to the EC's automatic fan control, which
     /// decides the speed on its own.
     fn enable_auto_control(&self) -> Result<(), FanError>;
+
+    /// Reads the current thermal data (the present temperature sensors and the
+    /// fans, each with its reading) from the embedded controller.
+    fn read_thermal(&self) -> Result<Thermal, FanError>;
 }
 
 #[cfg(test)]
@@ -236,6 +325,9 @@ mod tests {
         }
         fn enable_auto_control(&self) -> Result<(), FanError> {
             Ok(())
+        }
+        fn read_thermal(&self) -> Result<Thermal, FanError> {
+            Ok(Thermal::new(Vec::new(), Vec::new()))
         }
     }
 
@@ -271,7 +363,11 @@ mod tests {
     /// `from_hue` wraps at 360° and blends between the primary hues.
     #[test]
     fn from_hue_wraps_and_blends() {
-        assert_eq!(Color::from_hue(360.0), Color::new(255, 0, 0), "360° is red again");
+        assert_eq!(
+            Color::from_hue(360.0),
+            Color::new(255, 0, 0),
+            "360° is red again"
+        );
         assert_eq!(Color::from_hue(60.0), Color::new(255, 255, 0), "yellow");
         assert_eq!(Color::from_hue(180.0), Color::new(0, 255, 255), "cyan");
         assert_eq!(Color::from_hue(45.0), Color::new(255, 191, 0), "orange");
@@ -311,7 +407,10 @@ mod tests {
     fn speed_nudge_moves_by_the_given_step() {
         let mut control = SpeedControl::new();
         control.toggle(); // start manual control at the neutral speed
-        assert!(control.nudge(SPEED_STEP), "a nudge in range changes the speed");
+        assert!(
+            control.nudge(SPEED_STEP),
+            "a nudge in range changes the speed"
+        );
         assert_eq!(control.percent(), 53);
         assert!(control.nudge(-SPEED_STEP));
         assert_eq!(control.percent(), 50);
@@ -341,7 +440,11 @@ mod tests {
         assert_eq!(auto.state(), SpeedState::Auto);
         assert!(auto.nudge(SPEED_STEP));
         assert_eq!(auto.state(), SpeedState::Manual);
-        assert_eq!(auto.percent(), HIGH_SPEED, "up from auto jumps to the high speed");
+        assert_eq!(
+            auto.percent(),
+            HIGH_SPEED,
+            "up from auto jumps to the high speed"
+        );
     }
 
     /// `nudge` clamps the speed to `0..=100` and reports when it stops
@@ -384,5 +487,20 @@ mod tests {
             SpeedState::Manual,
             "the next x takes the speed back at the stored speed"
         );
+    }
+
+    /// A thermal snapshot keeps the sensor and fan readings, in order.
+    #[test]
+    fn thermal_keeps_sensor_and_fan_readings() {
+        let thermal = Thermal::new(
+            vec![TempReading::new("APU".to_string(), 45)],
+            vec![FanReading::new("APU Fan".to_string(), 2500)],
+        );
+        assert_eq!(thermal.sensors().len(), 1);
+        assert_eq!(thermal.sensors()[0].name(), "APU");
+        assert_eq!(thermal.sensors()[0].celsius(), 45);
+        assert_eq!(thermal.fans().len(), 1);
+        assert_eq!(thermal.fans()[0].name(), "APU Fan");
+        assert_eq!(thermal.fans()[0].rpm(), 2500);
     }
 }

@@ -27,6 +27,10 @@
 //!   then toggle the EC's automatic fan control on and off
 //! - `q` or `Esc` — quit
 //!
+//! To the right of the ring, a "Thermal" panel shows the EC's temperature
+//! sensors and fan speeds (the same data `framework_tool --thermal` prints),
+//! refreshed every 10 s.
+//!
 //! On start the app restores the colors it set last time, so it never
 //! overwrites a lit fan; when every LED is off it lights the fan with a
 //! rainbow. The EC cannot report the current colors, so the app keeps them in
@@ -40,21 +44,21 @@ use std::time::{Duration, Instant};
 
 use crossterm::cursor;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
 use crossterm::execute;
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color as RColor, Modifier, Style};
 use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
-use ratatui::{Frame, Terminal};
 use ratatui::widgets::canvas::{Canvas, Circle, Context, Points};
 use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::{Frame, Terminal};
 
-use crate::fan::{Color, FanController, LED_COUNT, SPEED_STEP, SpeedControl, SpeedState};
-use crate::led::{Channel, LedBank, RotationDirection, COLOR_STEP};
+use crate::fan::{Color, FanController, LED_COUNT, SPEED_STEP, SpeedControl, SpeedState, Thermal};
+use crate::led::{COLOR_STEP, Channel, LedBank, RotationDirection};
 use crate::state;
 
 /// How long the event loop waits for input before redrawing.
@@ -63,6 +67,9 @@ const POLL_TIMEOUT: Duration = Duration::from_millis(100);
 /// How often the colors shift around the ring while rotating: one position
 /// per 1/8 s, so a full turn takes one second.
 const ROTATION_INTERVAL: Duration = Duration::from_millis(125);
+
+/// How often the thermal data (temperatures and fan speeds) is refreshed.
+const THERMAL_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Radius of the fan ring in canvas units.
 const RING_RADIUS: f64 = 10.0;
@@ -86,6 +93,9 @@ struct App {
     speed: SpeedControl,
     /// Error from the last fan write, if any (shown in the footer).
     error: Option<String>,
+    /// The last thermal snapshot (temperatures and fan speeds), refreshed every
+    /// [`THERMAL_INTERVAL`]; `None` until the first successful read.
+    thermal: Option<Thermal>,
 }
 
 impl App {
@@ -107,6 +117,7 @@ impl App {
                     leds: LedBank::rainbow(),
                     speed: SpeedControl::new(),
                     error: None,
+                    thermal: None,
                 },
                 true,
             );
@@ -121,6 +132,7 @@ impl App {
                     leds,
                     speed: SpeedControl::new(),
                     error: None,
+                    thermal: None,
                 },
                 false,
             )
@@ -130,6 +142,7 @@ impl App {
                     leds: LedBank::rainbow(),
                     speed: SpeedControl::new(),
                     error: None,
+                    thermal: None,
                 },
                 true,
             )
@@ -143,7 +156,10 @@ impl App {
 
     /// Push the per-LED colors to the fan, remembering any error for display.
     fn apply<F: FanController>(&mut self, fan: &F) {
-        self.error = fan.write(&self.leds.colors()).err().map(|err| err.to_string());
+        self.error = fan
+            .write(&self.leds.colors())
+            .err()
+            .map(|err| err.to_string());
     }
 
     /// Save the current colors so the next run restores them instead of
@@ -165,6 +181,15 @@ impl App {
     /// error for display.
     fn apply_auto_control<F: FanController>(&mut self, fan: &F) {
         self.error = fan.enable_auto_control().err().map(|err| err.to_string());
+    }
+
+    /// Read the current thermal data, keeping the last good snapshot. A failed
+    /// read keeps the previous snapshot, so a transient EC error does not wipe
+    /// the panel.
+    fn read_thermal<F: FanController>(&mut self, fan: &F) {
+        if let Ok(thermal) = fan.read_thermal() {
+            self.thermal = Some(thermal);
+        }
     }
 
     /// Handle an arrow key: move the speed and write it to the fan when the
@@ -334,6 +359,13 @@ fn run_loop<F: FanController>(
         app.persist();
     }
 
+    // Read the thermal data once up front so the panel is not empty before the
+    // first refresh, and remember when that refresh is due. Each refresh counts
+    // from the previous deadline (not from "now"), so the 10 s cadence does not
+    // drift with frame times.
+    app.read_thermal(fan);
+    let mut next_thermal = Instant::now() + THERMAL_INTERVAL;
+
     // While the ring is rotating: the time of the next color shift. Each
     // shift counts from the previous deadline (not from "now"), so the 1/8 s
     // cadence does not drift with frame times. `None` while rotation is off.
@@ -358,16 +390,29 @@ fn run_loop<F: FanController>(
             next_shift = Some(next);
         }
 
+        // Refresh the thermal data once its deadline has come.
+        if now >= next_thermal {
+            app.read_thermal(fan);
+            let mut next = next_thermal + THERMAL_INTERVAL;
+            // Skip past any intervals that are already in the past (e.g.
+            // after a long sleep) without reading once per missed tick.
+            while next <= now {
+                next += THERMAL_INTERVAL;
+            }
+            next_thermal = next;
+        }
+
         terminal.draw(|frame| draw(frame, &app))?;
 
-        // Wait for input or for the next rotation shift, whichever comes
-        // first; if nothing is pending, just redraw on the next tick.
-        let wait = match next_shift {
-            Some(deadline) if app.leds.rotation_on() => {
-                deadline.saturating_duration_since(Instant::now())
-            }
-            _ => POLL_TIMEOUT,
-        };
+        // Wait for input or for the next deadline (rotation shift or thermal
+        // refresh), whichever comes first; if nothing is pending, just redraw
+        // on the next tick.
+        let wait = next_wait(
+            next_shift,
+            app.leds.rotation_on(),
+            next_thermal,
+            Instant::now(),
+        );
         if !event::poll(wait)? {
             continue;
         }
@@ -387,6 +432,22 @@ fn run_loop<F: FanController>(
         }
     }
     Ok(())
+}
+
+/// The time to wait for the next wake: the next rotation shift (while
+/// rotating), the next thermal refresh, or the poll timeout, whichever is
+/// soonest.
+fn next_wait(
+    next_shift: Option<Instant>,
+    rotating: bool,
+    next_thermal: Instant,
+    now: Instant,
+) -> Duration {
+    let base = match (next_shift, rotating) {
+        (Some(deadline), true) => deadline.saturating_duration_since(now),
+        _ => POLL_TIMEOUT,
+    };
+    base.min(next_thermal.saturating_duration_since(now))
 }
 
 /// Render one frame: title, fan (speed bar and ring), and footer.
@@ -412,10 +473,12 @@ fn draw_fan(frame: &mut Frame, app: &App, area: Rect) {
         .constraints([
             Constraint::Length(4), // speed bar
             Constraint::Min(8),    // fan ring
+            Constraint::Min(20),   // thermal panel
         ])
         .split(area);
     draw_speed_bar(frame, app, chunks[0]);
     draw_fan_ring(frame, app, chunks[1]);
+    draw_thermal(frame, app, chunks[2]);
 }
 
 /// The speed bar: a vertical meter filling from the bottom in proportion to
@@ -469,7 +532,71 @@ fn draw_speed_bar(frame: &mut Frame, app: &App, area: Rect) {
         label,
         Style::default().fg(bar).add_modifier(Modifier::BOLD),
     ));
-    frame.render_widget(Paragraph::new(label).alignment(Alignment::Center), chunks[1]);
+    frame.render_widget(
+        Paragraph::new(label).alignment(Alignment::Center),
+        chunks[1],
+    );
+}
+
+/// The thermal panel: the present temperature sensors and the fans, each with
+/// its current reading, refreshed every [`THERMAL_INTERVAL`]. Before the first
+/// successful read there is nothing to show but the (empty) frame.
+fn draw_thermal(frame: &mut Frame, app: &App, area: Rect) {
+    let block = Block::default().borders(Borders::ALL).title(" Thermal ");
+    frame.render_widget(Paragraph::new(thermal_lines(app)).block(block), area);
+}
+
+/// The lines of the thermal panel: a bold "Temperatures" heading, one line per
+/// sensor, a blank line, a bold "Fans" heading, and one line per fan.
+fn thermal_lines(app: &App) -> Vec<Line<'static>> {
+    let Some(thermal) = &app.thermal else {
+        return vec![Line::from("…")];
+    };
+
+    let name_width = thermal
+        .sensors()
+        .iter()
+        .map(|sensor| sensor.name().len())
+        .chain(thermal.fans().iter().map(|fan| fan.name().len()))
+        .max()
+        .unwrap_or(0);
+
+    let mut lines = vec![Line::from(Span::styled(
+        "Temperatures",
+        Style::default().add_modifier(Modifier::BOLD),
+    ))];
+    for sensor in thermal.sensors() {
+        lines.push(reading_line(
+            sensor.name(),
+            format!("{} C", sensor.celsius()),
+            name_width,
+            RColor::Yellow,
+        ));
+    }
+    lines.push(Line::from(" "));
+    lines.push(Line::from(Span::styled(
+        "Fans",
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    for fan in thermal.fans() {
+        lines.push(reading_line(
+            fan.name(),
+            format!("{} RPM", fan.rpm()),
+            name_width,
+            RColor::Cyan,
+        ));
+    }
+    lines
+}
+
+/// One "name  value" line: the name left-aligned to `name_width`, then the value
+/// in `color`.
+fn reading_line(name: &str, value: String, name_width: usize, color: RColor) -> Line<'static> {
+    let padded = format!("{:<name_width$}", name);
+    Line::from(vec![
+        Span::raw(format!(" {padded}  ")),
+        Span::styled(value, Style::default().fg(color)),
+    ])
 }
 
 /// Draw the fan: a disc filled with dots in the per-LED wedge colors, a dim
@@ -681,10 +808,7 @@ mod tests {
     /// The domain color maps to a truecolor RGB.
     #[test]
     fn domain_color_maps_to_truecolor() {
-        assert_eq!(
-            to_ratatui_color(Color::new(1, 2, 3)),
-            RColor::Rgb(1, 2, 3)
-        );
+        assert_eq!(to_ratatui_color(Color::new(1, 2, 3)), RColor::Rgb(1, 2, 3));
     }
 
     /// Rendering a frame lights up at least one cell per LED in the fan color.
@@ -694,9 +818,10 @@ mod tests {
             leds: red_bank(),
             speed: SpeedControl::new(),
             error: None,
+            thermal: None,
         };
-        let mut terminal = Terminal::new(TestBackend::new(80, 24))
-            .expect("test backend should initialize");
+        let mut terminal =
+            Terminal::new(TestBackend::new(80, 24)).expect("test backend should initialize");
         terminal
             .draw(|frame| draw(frame, &app))
             .expect("draw should not fail");
@@ -728,9 +853,10 @@ mod tests {
             leds,
             speed: SpeedControl::new(),
             error: None,
+            thermal: None,
         };
-        let mut terminal = Terminal::new(TestBackend::new(80, 24))
-            .expect("test backend should initialize");
+        let mut terminal =
+            Terminal::new(TestBackend::new(80, 24)).expect("test backend should initialize");
         terminal
             .draw(|frame| draw(frame, &app))
             .expect("draw should not fail");
@@ -741,7 +867,10 @@ mod tests {
         let reds = content.iter().filter(|cell| cell.fg == red).count();
         let blues = content.iter().filter(|cell| cell.fg == blue).count();
         assert!(reds > 40, "most of the disc should stay red, found {reds}");
-        assert!(blues > 5, "LED 2's wedge should be filled blue, found {blues}");
+        assert!(
+            blues > 5,
+            "LED 2's wedge should be filled blue, found {blues}"
+        );
     }
 
     /// The selected LED's number is drawn bold in the inverse of its wedge's
@@ -756,9 +885,10 @@ mod tests {
             leds,
             speed: SpeedControl::new(),
             error: None,
+            thermal: None,
         };
-        let mut terminal = Terminal::new(TestBackend::new(80, 24))
-            .expect("test backend should initialize");
+        let mut terminal =
+            Terminal::new(TestBackend::new(80, 24)).expect("test backend should initialize");
         terminal
             .draw(|frame| draw(frame, &app))
             .expect("draw should not fail");
@@ -785,9 +915,10 @@ mod tests {
             leds,
             speed: SpeedControl::new(),
             error: None,
+            thermal: None,
         };
-        let mut terminal = Terminal::new(TestBackend::new(80, 24))
-            .expect("test backend should initialize");
+        let mut terminal =
+            Terminal::new(TestBackend::new(80, 24)).expect("test backend should initialize");
         terminal
             .draw(|frame| draw(frame, &app))
             .expect("draw should not fail");
@@ -808,9 +939,10 @@ mod tests {
             leds: red_bank(),
             speed: SpeedControl::new(),
             error: None,
+            thermal: None,
         };
-        let mut terminal = Terminal::new(TestBackend::new(80, 24))
-            .expect("test backend should initialize");
+        let mut terminal =
+            Terminal::new(TestBackend::new(80, 24)).expect("test backend should initialize");
         terminal
             .draw(|frame| draw(frame, &app))
             .expect("draw should not fail");
@@ -832,9 +964,10 @@ mod tests {
             leds: red_bank(),
             speed: SpeedControl::new(),
             error: None,
+            thermal: None,
         };
-        let mut terminal = Terminal::new(TestBackend::new(80, 24))
-            .expect("test backend should initialize");
+        let mut terminal =
+            Terminal::new(TestBackend::new(80, 24)).expect("test backend should initialize");
         terminal
             .draw(|frame| draw(frame, &app))
             .expect("draw should not fail");
@@ -895,7 +1028,10 @@ mod tests {
     fn from_state_falls_back_to_rainbow_when_all_off() {
         let off = [Color::BLACK; LED_COUNT];
         let (app, write_on_start) = App::from_state(Some(off));
-        assert!(write_on_start, "an all-off fan must be lit with the rainbow");
+        assert!(
+            write_on_start,
+            "an all-off fan must be lit with the rainbow"
+        );
         assert_eq!(app.leds.colors(), LedBank::rainbow().colors());
 
         let (no_state, write_on_start) = App::from_state(None);
@@ -904,12 +1040,14 @@ mod tests {
     }
 
     /// A fan that records every interaction: the LED writes, the speeds it
-    /// was set to, and how often the auto control was enabled.
+    /// was set to, and how often the auto control was enabled. `read_thermal`
+    /// always returns the same fixed snapshot and counts the reads.
     #[derive(Default)]
     struct CountingFan {
         writes: std::cell::Cell<usize>,
         speeds: std::cell::RefCell<Vec<u8>>,
         auto_enables: std::cell::Cell<usize>,
+        thermal_reads: std::cell::Cell<usize>,
     }
 
     impl FanController for CountingFan {
@@ -925,6 +1063,35 @@ mod tests {
             self.auto_enables.set(self.auto_enables.get() + 1);
             Ok(())
         }
+        fn read_thermal(&self) -> Result<Thermal, crate::fan::FanError> {
+            self.thermal_reads.set(self.thermal_reads.get() + 1);
+            Ok(Thermal::new(
+                vec![crate::fan::TempReading::new("APU".to_string(), 45)],
+                vec![crate::fan::FanReading::new("APU Fan".to_string(), 2500)],
+            ))
+        }
+    }
+
+    /// A fan whose `read_thermal` always fails, to exercise the "keep the
+    /// previous snapshot" path.
+    struct FailingThermalFan;
+
+    impl FanController for FailingThermalFan {
+        fn write(&self, _colors: &[Color]) -> Result<(), crate::fan::FanError> {
+            Ok(())
+        }
+        fn set_speed(&self, _percent: u8) -> Result<(), crate::fan::FanError> {
+            Ok(())
+        }
+        fn enable_auto_control(&self) -> Result<(), crate::fan::FanError> {
+            Ok(())
+        }
+        fn read_thermal(&self) -> Result<Thermal, crate::fan::FanError> {
+            Err(crate::fan::FanError::WrongLedCount {
+                expected: LED_COUNT,
+                actual: 0,
+            })
+        }
     }
 
     /// `t` toggles the rotation and `s` flips its direction, and neither
@@ -936,6 +1103,7 @@ mod tests {
             leds: red_bank(),
             speed: SpeedControl::new(),
             error: None,
+            thermal: None,
         };
 
         assert!(!app.leds.rotation_on(), "rotation starts off");
@@ -950,7 +1118,10 @@ mod tests {
             "the rotation starts clockwise"
         );
 
-        assert!(app.handle_key(KeyCode::Char('s'), &fan), "s keeps the app running");
+        assert!(
+            app.handle_key(KeyCode::Char('s'), &fan),
+            "s keeps the app running"
+        );
         assert_eq!(
             app.leds.rotation_direction(),
             RotationDirection::CounterClockwise,
@@ -969,11 +1140,10 @@ mod tests {
     fn rotating_tui_shows_the_shifted_colors() {
         let fan = CountingFan::default();
         let mut app = App {
-            leds: LedBank::from_colors(std::array::from_fn(|i| {
-                Color::new((i + 1) as u8, 0, 0)
-            })),
+            leds: LedBank::from_colors(std::array::from_fn(|i| Color::new((i + 1) as u8, 0, 0))),
             speed: SpeedControl::new(),
             error: None,
+            thermal: None,
         };
         app.leds.toggle_rotation();
         app.leds.rotate(); // one tick, as the event loop performs it
@@ -982,8 +1152,16 @@ mod tests {
 
         assert_eq!(fan.writes.get(), 1, "the rotation tick writes the fan");
         let colors = app.leds.colors();
-        assert_eq!(colors[7], Color::new(1, 0, 0), "LED 1's color lands on LED 8");
-        assert_eq!(colors[0], Color::new(2, 0, 0), "LED 2's color lands on LED 1");
+        assert_eq!(
+            colors[7],
+            Color::new(1, 0, 0),
+            "LED 1's color lands on LED 8"
+        );
+        assert_eq!(
+            colors[0],
+            Color::new(2, 0, 0),
+            "LED 2's color lands on LED 1"
+        );
     }
 
     /// An app with a red bank in manual control at `percent`.
@@ -992,6 +1170,7 @@ mod tests {
             leds: red_bank(),
             speed: SpeedControl::new(),
             error: None,
+            thermal: None,
         };
         // Take the fan under manual control first (the neutral speed), then
         // step the stored speed to the target.
@@ -1013,13 +1192,32 @@ mod tests {
             leds: red_bank(),
             speed: SpeedControl::new(),
             error: None,
+            thermal: None,
         };
 
-        assert!(app.handle_key(KeyCode::Up, &fan), "Up keeps the app running");
-        assert_eq!(app.speed.state(), SpeedState::Manual, "Up takes manual control");
-        assert_eq!(app.speed.percent(), HIGH_SPEED, "the first Up jumps to the high speed");
-        assert!(app.handle_key(KeyCode::Down, &fan), "Down keeps the app running");
-        assert_eq!(app.speed.percent(), HIGH_SPEED - 3, "Down then fine-tunes the manual speed");
+        assert!(
+            app.handle_key(KeyCode::Up, &fan),
+            "Up keeps the app running"
+        );
+        assert_eq!(
+            app.speed.state(),
+            SpeedState::Manual,
+            "Up takes manual control"
+        );
+        assert_eq!(
+            app.speed.percent(),
+            HIGH_SPEED,
+            "the first Up jumps to the high speed"
+        );
+        assert!(
+            app.handle_key(KeyCode::Down, &fan),
+            "Down keeps the app running"
+        );
+        assert_eq!(
+            app.speed.percent(),
+            HIGH_SPEED - 3,
+            "Down then fine-tunes the manual speed"
+        );
 
         assert_eq!(
             fan.speeds.borrow().as_slice(),
@@ -1041,9 +1239,15 @@ mod tests {
         let fan = CountingFan::default();
         let mut app = app_with_speed(50);
 
-        assert!(app.handle_key(KeyCode::Up, &fan), "Up keeps the app running");
+        assert!(
+            app.handle_key(KeyCode::Up, &fan),
+            "Up keeps the app running"
+        );
         assert_eq!(app.speed.percent(), 53, "Up raises the speed by 3%");
-        assert!(app.handle_key(KeyCode::Down, &fan), "Down keeps the app running");
+        assert!(
+            app.handle_key(KeyCode::Down, &fan),
+            "Down keeps the app running"
+        );
         assert_eq!(app.speed.percent(), 50, "Down lowers the speed by 3%");
 
         assert_eq!(
@@ -1089,8 +1293,15 @@ mod tests {
         let fan = CountingFan::default();
         let mut app = app_with_speed(67);
 
-        assert!(app.handle_key(KeyCode::Char('x'), &fan), "x keeps the app running");
-        assert_eq!(app.speed.state(), SpeedState::Auto, "x turns the auto control on");
+        assert!(
+            app.handle_key(KeyCode::Char('x'), &fan),
+            "x keeps the app running"
+        );
+        assert_eq!(
+            app.speed.state(),
+            SpeedState::Auto,
+            "x turns the auto control on"
+        );
         assert_eq!(
             fan.auto_enables.get(),
             1,
@@ -1124,11 +1335,23 @@ mod tests {
             let mut app = app_with_speed(67);
             // Hand the speed to the EC: manual -> auto.
             app.handle_key(KeyCode::Char('x'), &fan);
-            assert_eq!(app.speed.state(), SpeedState::Auto, "x switches to the auto control");
+            assert_eq!(
+                app.speed.state(),
+                SpeedState::Auto,
+                "x switches to the auto control"
+            );
 
             assert!(app.handle_key(key, &fan), "the arrow keeps the app running");
-            assert_eq!(app.speed.state(), SpeedState::Manual, "the arrow takes manual control");
-            assert_eq!(app.speed.percent(), expected, "the arrow jumps to the target speed");
+            assert_eq!(
+                app.speed.state(),
+                SpeedState::Manual,
+                "the arrow takes manual control"
+            );
+            assert_eq!(
+                app.speed.percent(),
+                expected,
+                "the arrow jumps to the target speed"
+            );
             assert_eq!(
                 fan.speeds.borrow().as_slice(),
                 &[expected],
@@ -1146,11 +1369,16 @@ mod tests {
             leds: red_bank(),
             speed: SpeedControl::new(),
             error: None,
+            thermal: None,
         };
-        assert_eq!(app.speed.state(), SpeedState::Disabled, "the fan starts disabled");
+        assert_eq!(
+            app.speed.state(),
+            SpeedState::Disabled,
+            "the fan starts disabled"
+        );
 
-        let mut terminal = Terminal::new(TestBackend::new(80, 24))
-            .expect("test backend should initialize");
+        let mut terminal =
+            Terminal::new(TestBackend::new(80, 24)).expect("test backend should initialize");
         terminal
             .draw(|frame| draw(frame, &app))
             .expect("draw should not fail");
@@ -1171,8 +1399,8 @@ mod tests {
     fn speed_bar_fills_in_proportion_to_the_speed() {
         let fill_cells = |percent| {
             let app = app_with_speed(percent);
-            let mut terminal = Terminal::new(TestBackend::new(80, 24))
-                .expect("test backend should initialize");
+            let mut terminal =
+                Terminal::new(TestBackend::new(80, 24)).expect("test backend should initialize");
             terminal
                 .draw(|frame| draw(frame, &app))
                 .expect("draw should not fail");
@@ -1191,10 +1419,7 @@ mod tests {
 
         assert_eq!(at_zero, 0, "a 0% bar has no lit cells");
         assert!(at_half > 0, "a 50% bar is partly lit");
-        assert!(
-            at_full > at_half,
-            "a 100% bar is more lit than a 50% one"
-        );
+        assert!(at_full > at_half, "a 100% bar is more lit than a 50% one");
     }
 
     /// The bar's label shows the speed in percent, or "auto" while the EC's
@@ -1202,8 +1427,8 @@ mod tests {
     #[test]
     fn speed_bar_label_shows_the_percent_or_auto() {
         let app = app_with_speed(50);
-        let mut terminal = Terminal::new(TestBackend::new(80, 24))
-            .expect("test backend should initialize");
+        let mut terminal =
+            Terminal::new(TestBackend::new(80, 24)).expect("test backend should initialize");
         terminal
             .draw(|frame| draw(frame, &app))
             .expect("draw should not fail");
@@ -1227,5 +1452,168 @@ mod tests {
             .iter()
             .any(|cell| cell.symbol() == "u" && cell.fg == RColor::DarkGray);
         assert!(labeled, "auto mode is labeled with 'auto'");
+    }
+
+    /// `App::read_thermal` stores the snapshot it reads from the fan.
+    #[test]
+    fn read_thermal_stores_the_snapshot() {
+        let fan = CountingFan::default();
+        let mut app = App {
+            leds: red_bank(),
+            speed: SpeedControl::new(),
+            error: None,
+            thermal: None,
+        };
+        assert!(app.thermal.is_none(), "no snapshot before the first read");
+
+        app.read_thermal(&fan);
+
+        assert!(app.thermal.is_some(), "a successful read stores a snapshot");
+        let thermal = app.thermal.as_ref().expect("just read");
+        assert_eq!(thermal.sensors()[0].name(), "APU");
+        assert_eq!(thermal.sensors()[0].celsius(), 45);
+        assert_eq!(thermal.fans()[0].name(), "APU Fan");
+        assert_eq!(thermal.fans()[0].rpm(), 2500);
+        assert_eq!(fan.thermal_reads.get(), 1, "one read per call");
+    }
+
+    /// A failed `read_thermal` keeps the previous snapshot instead of wiping it.
+    #[test]
+    fn read_thermal_keeps_the_previous_snapshot_on_failure() {
+        let mut app = App {
+            leds: red_bank(),
+            speed: SpeedControl::new(),
+            error: None,
+            thermal: None,
+        };
+        app.read_thermal(&CountingFan::default());
+        let before = app.thermal.clone().expect("just read");
+
+        app.read_thermal(&FailingThermalFan);
+
+        assert_eq!(
+            app.thermal,
+            Some(before),
+            "a failure keeps the last good snapshot"
+        );
+    }
+
+    /// `thermal_lines` lists each sensor (with °C) and fan (with RPM).
+    #[test]
+    fn thermal_lines_lists_sensors_and_fans() {
+        let mut app = App {
+            leds: red_bank(),
+            speed: SpeedControl::new(),
+            error: None,
+            thermal: None,
+        };
+        app.read_thermal(&CountingFan::default());
+
+        let text = lines_text(&thermal_lines(&app));
+        assert!(text.contains("Temperatures"), "a temperatures heading");
+        assert!(text.contains("APU"), "the sensor name");
+        assert!(text.contains("45 C"), "the sensor temperature");
+        assert!(text.contains("Fans"), "a fans heading");
+        assert!(text.contains("APU Fan"), "the fan name");
+        assert!(text.contains("2500 RPM"), "the fan speed");
+    }
+
+    /// Before the first successful read, `thermal_lines` shows a placeholder.
+    #[test]
+    fn thermal_lines_shows_a_placeholder_before_the_first_read() {
+        let app = App {
+            leds: red_bank(),
+            speed: SpeedControl::new(),
+            error: None,
+            thermal: None,
+        };
+
+        let text = lines_text(&thermal_lines(&app));
+        assert!(!text.contains("RPM"), "no fan data before the first read");
+    }
+
+    /// `next_wait` returns the soonest of the rotation shift, the thermal
+    /// refresh, and the poll timeout.
+    #[test]
+    fn next_wait_picks_the_soonest_deadline() {
+        let now = Instant::now();
+        assert_eq!(
+            next_wait(None, false, now + Duration::from_secs(10), now),
+            POLL_TIMEOUT,
+            "when idle, wait the poll timeout"
+        );
+        assert_eq!(
+            next_wait(None, false, now + Duration::from_millis(50), now),
+            Duration::from_millis(50),
+            "a soon thermal refresh waits less"
+        );
+        assert_eq!(
+            next_wait(
+                Some(now + ROTATION_INTERVAL),
+                true,
+                now + Duration::from_secs(10),
+                now
+            ),
+            ROTATION_INTERVAL,
+            "while rotating, wait the shift interval"
+        );
+        assert_eq!(
+            next_wait(
+                Some(now + ROTATION_INTERVAL),
+                true,
+                now + Duration::from_millis(50),
+                now
+            ),
+            Duration::from_millis(50),
+            "a soon thermal refresh beats the next shift"
+        );
+        assert_eq!(
+            next_wait(
+                Some(now - Duration::from_secs(1)),
+                true,
+                now + Duration::from_secs(10),
+                now
+            ),
+            Duration::ZERO,
+            "an overdue shift waits no time"
+        );
+    }
+
+    /// The thermal panel renders the sensor and fan readings next to the ring.
+    #[test]
+    fn draw_shows_the_thermal_panel() {
+        let mut app = App {
+            leds: red_bank(),
+            speed: SpeedControl::new(),
+            error: None,
+            thermal: None,
+        };
+        app.read_thermal(&CountingFan::default());
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("test backend");
+        terminal
+            .draw(|frame| draw(frame, &app))
+            .expect("draw should not fail");
+
+        let content = terminal.backend().buffer().content();
+        let text: String = content
+            .iter()
+            .map(|cell| cell.symbol().to_string())
+            .collect();
+        assert!(
+            text.contains("Temperatures"),
+            "the panel has a temperatures heading"
+        );
+        assert!(text.contains("45 C"), "the temperature reading is shown");
+        assert!(text.contains("2500 RPM"), "the fan speed is shown");
+    }
+
+    /// Concatenate every span's text across the given lines.
+    fn lines_text(lines: &[Line<'_>]) -> String {
+        lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+            .collect::<Vec<_>>()
+            .concat()
     }
 }
