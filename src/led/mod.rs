@@ -1,6 +1,7 @@
 //! Per-LED control for the fan.
 //!
-//! The fan has [`LED_COUNT`] addressable LEDs, numbered **1 to 8**: a LED's
+//! The fan has [`LED_COUNT`](crate::fan::LED_COUNT) addressable LEDs,
+//! numbered **1 to 8**: a LED's
 //! number matches the keyboard key that selects it and the label drawn on the
 //! fan ring. Internally the LEDs are indexed `0..LED_COUNT` (as on the EC), so
 //! a number is just `index + 1`.
@@ -11,8 +12,11 @@
 //! - `r`/`R`, `g`/`G`, `b`/`B` — increase / decrease the selected channel
 //! - `a` — toggle all-mode: color changes apply to every LED
 //! - `t` — toggle the rotation: the colors travel around the ring, one
-//!   position per step (the TUI steps them every 1/8 s while it is on)
+//!   position per step (the TUI steps them at the current rotation speed while
+//!   it is on)
 //! - `s` — flip the rotation direction ([`RotationDirection`])
+//! - `+`/`-` — increase / decrease the rotation speed ([`RotationSpeed`]),
+//!   from 0.1 to 10 hz
 
 mod bank;
 mod channel;
@@ -20,7 +24,7 @@ mod rotation;
 
 pub use bank::LedBank;
 pub use channel::Channel;
-pub use rotation::RotationDirection;
+pub use rotation::{RotationDirection, RotationSpeed};
 
 use crate::fan::Color;
 

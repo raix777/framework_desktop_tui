@@ -1,6 +1,6 @@
 use super::Led;
 use super::channel::Channel;
-use super::rotation::RotationDirection;
+use super::rotation::{RotationDirection, RotationSpeed};
 use crate::fan::{Color, LED_COUNT};
 
 /// The full set of fan LEDs plus the currently selected one.
@@ -16,11 +16,13 @@ pub struct LedBank {
     all_mode: bool,
     rotation: bool,
     direction: RotationDirection,
+    rotation_speed: RotationSpeed,
 }
 
 impl LedBank {
     /// Build a bank from explicit per-LED colors (in ring order). LED 1 is
-    /// selected; all-mode and rotation start off.
+    /// selected; all-mode and rotation start off, the rotation at its default
+    /// speed.
     pub fn from_colors(colors: [Color; LED_COUNT]) -> Self {
         let leds = std::array::from_fn(|index| Led::new((index + 1) as u8, colors[index]));
         Self {
@@ -29,6 +31,7 @@ impl LedBank {
             all_mode: false,
             rotation: false,
             direction: RotationDirection::Clockwise,
+            rotation_speed: RotationSpeed::new(),
         }
     }
 
@@ -131,6 +134,21 @@ impl LedBank {
     /// Flip the rotation direction.
     pub fn flip_direction(&mut self) {
         self.direction = self.direction.flipped();
+    }
+
+    /// The current rotation speed (full rotations per second).
+    pub fn rotation_speed(&self) -> RotationSpeed {
+        self.rotation_speed
+    }
+
+    /// Increase the rotation speed by one step (0.1 hz below 1 hz, 1 hz above).
+    pub fn increase_rotation_speed(&mut self) {
+        self.rotation_speed.increase();
+    }
+
+    /// Decrease the rotation speed by one step (1 hz above 1 hz, 0.1 hz below).
+    pub fn decrease_rotation_speed(&mut self) {
+        self.rotation_speed.decrease();
     }
 
     /// Shift every LED's color one position around the ring, in the current
@@ -332,6 +350,19 @@ mod tests {
         );
         bank.flip_direction();
         assert_eq!(bank.rotation_direction(), RotationDirection::Clockwise);
+    }
+
+    /// The rotation speed starts at the default (1 hz) and steps up and down
+    /// with the + / - logic (1 hz steps at or above 1 hz).
+    #[test]
+    fn the_rotation_speed_steps_through_the_bank() {
+        let mut bank = LedBank::rainbow();
+        assert_eq!(bank.rotation_speed().hertz(), 1.0, "the default speed");
+        bank.increase_rotation_speed();
+        assert_eq!(bank.rotation_speed().hertz(), 2.0, "+ steps up by 1 hz");
+        bank.decrease_rotation_speed();
+        bank.decrease_rotation_speed();
+        assert_eq!(bank.rotation_speed().hertz(), 0.9, "- steps down to the fine range");
     }
 
     /// Clockwise: each color moves to the previous LED's position (LED 1's

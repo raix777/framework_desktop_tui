@@ -24,8 +24,11 @@
 //!   wraps around at the ends) and set the target LED (or all LEDs) to that
 //!   hue; selecting a LED re-points the slider at its current hue
 //! - `t` — toggle the rotation: while on, the colors shift one position
-//!   around the ring every 1/8 s (LED 1's color moves to LED 8, and so on)
+//!   around the ring at the current rotation speed (LED 1's color moves to
+//!   LED 8, and so on)
 //! - `s` — flip the rotation direction (clockwise ↔ counter-clockwise)
+//! - `+`/`-` — increase / decrease the rotation speed (full rotations per
+//!   second, 0.1 to 10 hz: steps of 0.1 hz below 1 hz, 1 hz above)
 //! - `Up` / `Down` — a vertical bar to the left of the ring shows the speed
 //!   in percent; while the app controls the speed they change it by 3%, and
 //!   while it does not (disabled at startup, or the EC's automatic control)
@@ -68,15 +71,11 @@ use ratatui::{Frame, Terminal};
 use crate::fan::{
     Color, FanController, LED_COUNT, SPEED_STEP, SpeedControl, SpeedState, ThermalSnapshot,
 };
-use crate::led::{COLOR_STEP, Channel, LedBank, RotationDirection};
+use crate::led::{COLOR_STEP, Channel, LedBank, RotationDirection, RotationSpeed};
 use crate::state;
 
 /// How long the event loop waits for input before redrawing.
 const POLL_TIMEOUT: Duration = Duration::from_millis(100);
-
-/// How often the colors shift around the ring while rotating: one position
-/// per 1/8 s, so a full turn takes one second.
-const ROTATION_INTERVAL: Duration = Duration::from_millis(125);
 
 /// How often the thermal data (temperatures and fan speeds) is refreshed.
 const THERMAL_INTERVAL: Duration = Duration::from_secs(10);
@@ -304,14 +303,22 @@ impl App {
                 return true;
             }
             // Rotation only changes which colors the event loop will shift on
-            // its next 1/8 s tick (or where they will go); neither changes
-            // the fan right now, so no write is needed.
+            // its next tick (and how often); neither changes the fan right
+            // now, so no write is needed.
             KeyCode::Char('t') => {
                 self.leds.toggle_rotation();
                 return true;
             }
             KeyCode::Char('s') => {
                 self.leds.flip_direction();
+                return true;
+            }
+            KeyCode::Char('+') => {
+                self.leds.increase_rotation_speed();
+                return true;
+            }
+            KeyCode::Char('-') => {
+                self.leds.decrease_rotation_speed();
                 return true;
             }
             KeyCode::Up => return self.nudge_speed(SPEED_STEP, fan),
@@ -431,8 +438,8 @@ pub fn run<F: FanController>(fan: &F) -> Result<(), Box<dyn std::error::Error>> 
 /// The main loop: draw a frame, then wait for input.
 ///
 /// While the color ring is rotating, the loop also shifts the colors one
-/// position every [`ROTATION_INTERVAL`] (1/8 s) and writes the fan, so the
-/// colors travel around the ring at one position per tick.
+/// position at the rotation's current interval (which depends on its speed)
+/// and writes the fan, so the colors travel around the ring at that speed.
 fn run_loop<F: FanController>(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     fan: &F,
@@ -453,11 +460,14 @@ fn run_loop<F: FanController>(
     let mut next_thermal = Instant::now() + THERMAL_INTERVAL;
 
     // While the ring is rotating: the time of the next color shift. Each
-    // shift counts from the previous deadline (not from "now"), so the 1/8 s
-    // cadence does not drift with frame times. `None` while rotation is off.
+    // shift counts from the previous deadline (not from "now"), so the cadence
+    // does not drift with frame times. `None` while rotation is off.
     let mut next_shift: Option<Instant> = None;
 
     loop {
+        // The rotation's current interval (from its speed).
+        let interval = app.leds.rotation_speed().interval();
+
         // Shift the colors once the ring's deadline has come.
         let now = Instant::now();
         if let Some(deadline) = next_shift
@@ -467,11 +477,11 @@ fn run_loop<F: FanController>(
             app.leds.rotate();
             app.apply(fan);
             app.persist();
-            let mut next = deadline + ROTATION_INTERVAL;
+            let mut next = deadline + interval;
             // Skip past any intervals that are already in the past (e.g.
             // after a long sleep) without shifting once per missed tick.
             while next <= now {
-                next += ROTATION_INTERVAL;
+                next += interval;
             }
             next_shift = Some(next);
         }
@@ -506,14 +516,17 @@ fn run_loop<F: FanController>(
             && key.kind == KeyEventKind::Press
         {
             let was_rotating = app.leds.rotation_on();
+            let was_speed: RotationSpeed = app.leds.rotation_speed();
             if !app.handle_key(key.code, fan) {
                 break;
             }
             let is_rotating = app.leds.rotation_on();
-            if was_rotating != is_rotating {
-                // The first shift happens 1/8 s after the toggle (or ticking
-                // stops altogether when the rotation is switched off).
-                next_shift = is_rotating.then(|| Instant::now() + ROTATION_INTERVAL);
+            let is_speed: RotationSpeed = app.leds.rotation_speed();
+            // The rotation (re)started, stopped, or changed speed: the next
+            // shift is one interval from now at the new speed (or ticking stops
+            // altogether when the rotation is off).
+            if was_rotating != is_rotating || was_speed != is_speed {
+                next_shift = is_rotating.then(|| Instant::now() + is_speed.interval());
             }
         }
     }
@@ -888,10 +901,13 @@ fn footer(app: &App) -> Paragraph<'static> {
         Span::raw("rot "),
         Span::styled(" s ", Style::default().fg(RColor::Cyan)),
         Span::raw("dir "),
+        Span::styled(" +/- ", Style::default().fg(RColor::Cyan)),
+        Span::raw("rspd "),
         Span::styled(" q ", Style::default().fg(RColor::Cyan)),
         Span::raw("quit"),
     ]);
-    // The rotation state: off, or the direction the colors travel.
+    // The rotation state: off, or the direction the colors travel, at the
+    // current speed.
     let rotation = if app.leds.rotation_on() {
         match app.leds.rotation_direction() {
             RotationDirection::Clockwise => "clockwise",
@@ -900,6 +916,7 @@ fn footer(app: &App) -> Paragraph<'static> {
     } else {
         "off"
     };
+    let rotation = format!("{rotation} ({} hz)", app.leds.rotation_speed().hertz());
     let status = match &app.error {
         Some(err) => Line::from(Span::styled(
             format!("fan error: {err}   rotation: {rotation}"),
@@ -1269,6 +1286,33 @@ mod tests {
         assert_eq!(fan.writes.get(), 0, "t and s must not write the fan");
     }
 
+    /// `+` and `-` change the rotation speed (1 hz steps at the default 1 hz
+    /// and above), and neither writes the fan.
+    #[test]
+    fn plus_minus_change_the_rotation_speed_without_a_write() {
+        let fan = CountingFan::default();
+        let mut app = App::new(red_bank());
+        assert_eq!(app.leds.rotation_speed().hertz(), 1.0, "the default speed");
+
+        assert!(
+            app.handle_key(KeyCode::Char('+'), &fan),
+            "+ keeps the app running"
+        );
+        assert_eq!(app.leds.rotation_speed().hertz(), 2.0, "+ raises the speed by 1 hz");
+        assert!(
+            app.handle_key(KeyCode::Char('-'), &fan),
+            "- keeps the app running"
+        );
+        assert!(app.handle_key(KeyCode::Char('-'), &fan));
+        assert_eq!(
+            app.leds.rotation_speed().hertz(),
+            0.9,
+            "- twice lowers the speed into the fine range"
+        );
+
+        assert_eq!(fan.writes.get(), 0, "changing the speed does not write the fan");
+    }
+
     /// While rotating, one shift per direction moves the colors exactly as
     /// the rotation promises: clockwise sends LED 1's color to LED 8.
     #[test]
@@ -1634,6 +1678,7 @@ mod tests {
     #[test]
     fn next_wait_picks_the_soonest_deadline() {
         let now = Instant::now();
+        let shift = Duration::from_millis(125); // the default rotation interval
         assert_eq!(
             next_wait(None, false, now + Duration::from_secs(10), now),
             POLL_TIMEOUT,
@@ -1645,22 +1690,12 @@ mod tests {
             "a soon thermal refresh waits less"
         );
         assert_eq!(
-            next_wait(
-                Some(now + ROTATION_INTERVAL),
-                true,
-                now + Duration::from_secs(10),
-                now
-            ),
-            ROTATION_INTERVAL,
+            next_wait(Some(now + shift), true, now + Duration::from_secs(10), now),
+            shift,
             "while rotating, wait the shift interval"
         );
         assert_eq!(
-            next_wait(
-                Some(now + ROTATION_INTERVAL),
-                true,
-                now + Duration::from_millis(50),
-                now
-            ),
+            next_wait(Some(now + shift), true, now + Duration::from_millis(50), now),
             Duration::from_millis(50),
             "a soon thermal refresh beats the next shift"
         );
