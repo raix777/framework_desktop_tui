@@ -101,6 +101,12 @@ impl LedBank {
         self.update_targets(|led| led.set_color(color));
     }
 
+    /// Toggle the target LED(s) between off (black) and the color they had
+    /// before.
+    pub fn toggle_off(&mut self) {
+        self.update_targets(|led| led.toggle_off());
+    }
+
     /// Apply `update` to the target LED(s): every LED when all-mode is on,
     /// otherwise just the selected one.
     fn update_targets(&mut self, mut update: impl FnMut(&mut Led)) {
@@ -126,14 +132,24 @@ impl LedBank {
         self.rotation
     }
 
+    /// Whether the rotation is running: the toggle is on and at least one
+    /// LED is lit. While every LED is off the rotation is stopped (there is
+    /// nothing to rotate), and its direction and speed controls do nothing.
+    pub fn rotating(&self) -> bool {
+        self.rotation && self.any_lit()
+    }
+
     /// The direction the colors travel while rotating (clockwise by default).
     pub fn rotation_direction(&self) -> RotationDirection {
         self.direction
     }
 
-    /// Flip the rotation direction.
+    /// Flip the rotation direction. Does nothing while every LED is off
+    /// (the rotation is then stopped).
     pub fn flip_direction(&mut self) {
-        self.direction = self.direction.flipped();
+        if self.any_lit() {
+            self.direction = self.direction.flipped();
+        }
     }
 
     /// The current rotation speed (full rotations per second).
@@ -141,14 +157,22 @@ impl LedBank {
         self.rotation_speed
     }
 
-    /// Increase the rotation speed by one step (0.1 hz below 1 hz, 1 hz above).
+    /// Increase the rotation speed by one step (0.1 hz below 1 hz, 1 hz
+    /// above). Does nothing while every LED is off (the rotation is then
+    /// stopped).
     pub fn increase_rotation_speed(&mut self) {
-        self.rotation_speed.increase();
+        if self.any_lit() {
+            self.rotation_speed.increase();
+        }
     }
 
-    /// Decrease the rotation speed by one step (1 hz above 1 hz, 0.1 hz below).
+    /// Decrease the rotation speed by one step (1 hz above 1 hz, 0.1 hz
+    /// below). Does nothing while every LED is off (the rotation is then
+    /// stopped).
     pub fn decrease_rotation_speed(&mut self) {
-        self.rotation_speed.decrease();
+        if self.any_lit() {
+            self.rotation_speed.decrease();
+        }
     }
 
     /// Shift every LED's color one position around the ring, in the current
@@ -305,6 +329,80 @@ mod tests {
         }
     }
 
+    /// `toggle_off` blacks out the selected LED and remembers its color, so
+    /// the second toggle restores it; the other LEDs are untouched.
+    #[test]
+    fn toggle_off_blacks_out_the_selected_led_and_restores_it_again() {
+        let mut bank = red_bank();
+        bank.select(3);
+
+        bank.toggle_off();
+        let colors = bank.colors();
+        assert_eq!(colors[2], Color::BLACK, "the selected LED is black");
+        for (index, color) in colors.iter().enumerate() {
+            if index != 2 {
+                assert_eq!(
+                    *color,
+                    Color::new(255, 0, 0),
+                    "LED {index} should be untouched"
+                );
+            }
+        }
+
+        bank.toggle_off();
+        assert_eq!(
+            bank.selected().color(),
+            Color::new(255, 0, 0),
+            "the second toggle restores the color"
+        );
+    }
+
+    /// In all-mode, `toggle_off` blacks out every LED, and the second toggle
+    /// restores each LED to the color it had (per LED, not one shared color).
+    #[test]
+    fn toggle_off_in_all_mode_restores_every_led_to_its_own_color() {
+        let mut bank = distinct_bank();
+        let before = bank.colors();
+        bank.toggle_all();
+
+        bank.toggle_off();
+        for color in bank.colors() {
+            assert_eq!(color, Color::BLACK, "every LED should be black");
+        }
+
+        bank.toggle_off();
+        assert_eq!(bank.colors(), before, "every LED is back to its own color");
+    }
+
+    /// A black LED that the toggle never turned off has no remembered color,
+    /// so `toggle_off` leaves it black even while the other LEDs toggle.
+    #[test]
+    fn toggle_off_leaves_a_fresh_black_led_alone() {
+        let mut colors = [Color::BLACK; LED_COUNT];
+        colors[7] = Color::new(255, 0, 0); // only LED 8 is lit
+        let mut bank = LedBank::from_colors(colors);
+        bank.toggle_all();
+
+        bank.toggle_off();
+        assert_eq!(bank.colors()[7], Color::BLACK, "the lit LED is blacked out");
+
+        bank.toggle_off();
+        assert_eq!(
+            bank.colors()[7],
+            Color::new(255, 0, 0),
+            "the toggled LED is restored"
+        );
+        for (index, color) in bank.colors().iter().enumerate() {
+            if index != 7 {
+                assert_eq!(
+                    *color,
+                    Color::BLACK,
+                    "LED {index} was never toggled off, so it has no color to restore"
+                );
+            }
+        }
+    }
+
     /// `toggle_all` flips all-mode, which starts off.
     #[test]
     fn toggle_all_flips_the_mode() {
@@ -363,6 +461,85 @@ mod tests {
         bank.decrease_rotation_speed();
         bank.decrease_rotation_speed();
         assert_eq!(bank.rotation_speed().hertz(), 0.9, "- steps down to the fine range");
+    }
+
+    /// `rotating` is true only while the rotation toggle is on and at least
+    /// one LED is lit: an all-off fan has nothing to rotate.
+    #[test]
+    fn rotating_requires_a_lit_led() {
+        let mut bank = LedBank::rainbow();
+        assert!(!bank.rotating(), "rotation is off by default");
+
+        bank.toggle_rotation();
+        assert!(bank.rotating(), "on and lit: running");
+
+        bank.toggle_all();
+        bank.toggle_off(); // every LED black
+        assert!(!bank.any_lit());
+        assert!(bank.rotation_on(), "the toggle stays on ...");
+        assert!(
+            !bank.rotating(),
+            "... but the rotation is stopped while all off"
+        );
+
+        bank.toggle_off(); // every LED back to its color
+        assert!(bank.rotating(), "lit again: running again");
+    }
+
+    /// The rotation toggle still works while every LED is off: it turns the
+    /// rotation on (stopped) or off, it just cannot run while all off.
+    #[test]
+    fn toggle_rotation_still_works_while_every_led_is_off() {
+        let mut bank = LedBank::from_colors([Color::BLACK; LED_COUNT]);
+        assert!(bank.toggle_rotation(), "the toggle turns the rotation on");
+        assert!(bank.rotation_on());
+        assert!(!bank.rotating(), "... but it is stopped while all off");
+        assert!(!bank.toggle_rotation(), "the toggle turns it off again");
+    }
+
+    /// `flip_direction` does nothing while every LED is off (the rotation is
+    /// stopped), and works again once a LED is lit.
+    #[test]
+    fn flip_direction_is_disabled_while_every_led_is_off() {
+        let mut bank = LedBank::from_colors([Color::BLACK; LED_COUNT]);
+        bank.flip_direction();
+        assert_eq!(
+            bank.rotation_direction(),
+            RotationDirection::Clockwise,
+            "no flip while all off"
+        );
+
+        bank.select(1);
+        bank.set_color(Color::new(255, 0, 0));
+        bank.flip_direction();
+        assert_eq!(
+            bank.rotation_direction(),
+            RotationDirection::CounterClockwise,
+            "flips again once a LED is lit"
+        );
+    }
+
+    /// The rotation speed does not change while every LED is off (the
+    /// rotation is stopped), and steps again once a LED is lit.
+    #[test]
+    fn rotation_speed_is_disabled_while_every_led_is_off() {
+        let mut bank = LedBank::from_colors([Color::BLACK; LED_COUNT]);
+        bank.increase_rotation_speed();
+        bank.decrease_rotation_speed();
+        assert_eq!(
+            bank.rotation_speed().hertz(),
+            1.0,
+            "unchanged while all off"
+        );
+
+        bank.select(1);
+        bank.set_color(Color::new(255, 0, 0));
+        bank.increase_rotation_speed();
+        assert_eq!(
+            bank.rotation_speed().hertz(),
+            2.0,
+            "steps up again once a LED is lit"
+        );
     }
 
     /// Clockwise: each color moves to the previous LED's position (LED 1's

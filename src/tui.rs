@@ -20,12 +20,16 @@
 //! - `r` / `R` — increase / decrease red (selected LED, or all when toggled)
 //! - `g` / `G` — increase / decrease green
 //! - `b` / `B` — increase / decrease blue
+//! - `c` — toggle the target LED (or every LED in all-mode) between off
+//!   (black) and the color it had before
 //! - `Left` / `Right` — move the hue slider down / up the color wheel (it
 //!   wraps around at the ends) and set the target LED (or all LEDs) to that
 //!   hue; selecting a LED re-points the slider at its current hue
 //! - `t` — toggle the rotation: while on, the colors shift one position
 //!   around the ring at the current rotation speed (LED 1's color moves to
-//!   LED 8, and so on)
+//!   LED 8, and so on). While every LED is off the rotation is stopped
+//!   (nothing to rotate), and `s` and `+`/`-` do nothing; when a LED is lit
+//!   again, the rotation picks up where it left off
 //! - `s` — flip the rotation direction (clockwise ↔ counter-clockwise)
 //! - `+`/`-` — increase / decrease the rotation speed (full rotations per
 //!   second, 0.1 to 10 hz: steps of 0.1 hz below 1 hz, 1 hz above)
@@ -343,6 +347,9 @@ impl App {
             KeyCode::Char('G') => self.leds.adjust(Channel::Green, -COLOR_STEP),
             KeyCode::Char('b') => self.leds.adjust(Channel::Blue, COLOR_STEP),
             KeyCode::Char('B') => self.leds.adjust(Channel::Blue, -COLOR_STEP),
+            // Toggle the target LED (or every LED in all-mode) between off
+            // (black) and its previous color.
+            KeyCode::Char('c') => self.leds.toggle_off(),
             _ => return true,
         }
         self.apply(fan);
@@ -440,6 +447,8 @@ pub fn run<F: FanController>(fan: &F) -> Result<(), Box<dyn std::error::Error>> 
 /// While the color ring is rotating, the loop also shifts the colors one
 /// position at the rotation's current interval (which depends on its speed)
 /// and writes the fan, so the colors travel around the ring at that speed.
+/// The rotation is stopped while every LED is off, so while the fan is
+/// all-black nothing shifts and nothing is written.
 fn run_loop<F: FanController>(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     fan: &F,
@@ -468,10 +477,12 @@ fn run_loop<F: FanController>(
         // The rotation's current interval (from its speed).
         let interval = app.leds.rotation_speed().interval();
 
-        // Shift the colors once the ring's deadline has come.
+        // Shift the colors once the ring's deadline has come. While every
+        // LED is off the rotation is stopped, so nothing shifts (or writes
+        // the fan) until a LED is lit again.
         let now = Instant::now();
         if let Some(deadline) = next_shift
-            && app.leds.rotation_on()
+            && app.leds.rotating()
             && now >= deadline
         {
             app.leds.rotate();
@@ -505,7 +516,7 @@ fn run_loop<F: FanController>(
         // on the next tick.
         let wait = next_wait(
             next_shift,
-            app.leds.rotation_on(),
+            app.leds.rotating(),
             next_thermal,
             Instant::now(),
         );
@@ -891,6 +902,8 @@ fn footer(app: &App) -> Paragraph<'static> {
         Span::raw("all "),
         Span::styled(" r/g/b ", Style::default().fg(RColor::Cyan)),
         Span::raw("rgb "),
+        Span::styled(" c ", Style::default().fg(RColor::Cyan)),
+        Span::raw("off "),
         Span::styled(" ←→ ", Style::default().fg(RColor::Cyan)),
         Span::raw("hue "),
         Span::styled(" ↑↓ ", Style::default().fg(RColor::Cyan)),
@@ -908,7 +921,7 @@ fn footer(app: &App) -> Paragraph<'static> {
     ]);
     // The rotation state: off, or the direction the colors travel, at the
     // current speed.
-    let rotation = if app.leds.rotation_on() {
+    let rotation = if app.leds.rotating() {
         match app.leds.rotation_direction() {
             RotationDirection::Clockwise => "clockwise",
             RotationDirection::CounterClockwise => "counter-clockwise",
@@ -1284,6 +1297,68 @@ mod tests {
         assert!(!app.leds.rotation_on(), "t turns the rotation off again");
 
         assert_eq!(fan.writes.get(), 0, "t and s must not write the fan");
+    }
+
+    /// While every LED is off the rotation is stopped, so `s` and `+`/`-` do
+    /// nothing (and nothing is written to the fan).
+    #[test]
+    fn rotation_direction_and_speed_keys_are_disabled_while_every_led_is_off() {
+        let fan = CountingFan::default();
+        let mut app = App::new(LedBank::from_colors([Color::BLACK; LED_COUNT]));
+
+        assert!(
+            app.handle_key(KeyCode::Char('s'), &fan),
+            "s keeps the app running"
+        );
+        assert_eq!(
+            app.leds.rotation_direction(),
+            RotationDirection::Clockwise,
+            "s does not flip the direction while all off"
+        );
+        assert!(app.handle_key(KeyCode::Char('+'), &fan), "+ keeps the app running");
+        assert!(app.handle_key(KeyCode::Char('-'), &fan), "- keeps the app running");
+        assert_eq!(
+            app.leds.rotation_speed().hertz(),
+            1.0,
+            "the speed is unchanged while all off"
+        );
+
+        assert_eq!(fan.writes.get(), 0, "the disabled keys do not write the fan");
+    }
+
+    /// The footer reports the rotation as off while every LED is off, even
+    /// though the rotation toggle is on.
+    #[test]
+    fn the_footer_reports_the_rotation_as_off_while_every_led_is_off() {
+        let footer_text = |app: &App| {
+            let mut terminal =
+                Terminal::new(TestBackend::new(100, 24)).expect("test backend");
+            terminal
+                .draw(|frame| draw(frame, app))
+                .expect("draw should not fail");
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol().to_string())
+                .collect::<String>()
+        };
+
+        let mut stopped = App::new(LedBank::from_colors([Color::BLACK; LED_COUNT]));
+        stopped.leds.toggle_rotation();
+        assert!(stopped.leds.rotation_on(), "the toggle is on");
+        assert!(
+            footer_text(&stopped).contains("rotation: off"),
+            "the stopped rotation is reported as off"
+        );
+
+        let mut running = App::new(LedBank::rainbow());
+        running.leds.toggle_rotation();
+        assert!(
+            footer_text(&running).contains("rotation: clockwise"),
+            "a running rotation is reported by its direction"
+        );
     }
 
     /// `+` and `-` change the rotation speed (1 hz steps at the default 1 hz
@@ -1897,6 +1972,83 @@ mod tests {
             assert_eq!(led_color, color, "every LED takes the slider's color");
         }
         assert_eq!(fan.writes.get(), 1, "the new color is written to the fan");
+    }
+
+    /// `c` blacks out the selected LED and writes the fan; the other LEDs are
+    /// untouched.
+    #[test]
+    fn c_blacks_out_the_selected_led() {
+        let fan = CountingFan::default();
+        let mut app = App::new(red_bank());
+        app.leds.select(3);
+
+        assert!(
+            app.handle_key(KeyCode::Char('c'), &fan),
+            "c keeps the app running"
+        );
+        let colors = app.leds.colors();
+        assert_eq!(colors[2], Color::BLACK, "the selected LED is black");
+        for (index, color) in colors.iter().enumerate() {
+            if index != 2 {
+                assert_eq!(
+                    *color,
+                    Color::new(255, 0, 0),
+                    "LED {index} should be untouched"
+                );
+            }
+        }
+        assert_eq!(fan.writes.get(), 1, "the new color is written to the fan");
+    }
+
+    /// In all-mode, `c` blacks out every LED.
+    #[test]
+    fn c_blacks_out_every_led_in_all_mode() {
+        let fan = CountingFan::default();
+        let mut app = App::new(red_bank());
+        app.leds.toggle_all();
+        assert!(app.leds.all_mode());
+
+        assert!(
+            app.handle_key(KeyCode::Char('c'), &fan),
+            "c keeps the app running"
+        );
+        for color in app.leds.colors() {
+            assert_eq!(color, Color::BLACK, "every LED should be black");
+        }
+        assert_eq!(fan.writes.get(), 1, "the new color is written to the fan");
+    }
+
+    /// Pressing `c` twice in a row blacks out the selected LED and then
+    /// restores its previous color.
+    #[test]
+    fn c_twice_restores_the_previous_color() {
+        let fan = CountingFan::default();
+        let mut app = App::new(red_bank());
+        app.leds.select(3);
+
+        assert!(
+            app.handle_key(KeyCode::Char('c'), &fan),
+            "the first c keeps the app running"
+        );
+        assert_eq!(
+            app.leds.selected().color(),
+            Color::BLACK,
+            "the first c blacks out the LED"
+        );
+        assert!(
+            app.handle_key(KeyCode::Char('c'), &fan),
+            "the second c keeps the app running"
+        );
+        assert_eq!(
+            app.leds.selected().color(),
+            Color::new(255, 0, 0),
+            "the second c restores the previous color"
+        );
+        assert_eq!(
+            fan.writes.get(),
+            2,
+            "each press writes the fan"
+        );
     }
 
     /// Selecting a LED re-points the hue slider at that LED's hue (without
