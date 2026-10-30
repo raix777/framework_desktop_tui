@@ -32,7 +32,7 @@ pub use rotation::{RotationDirection, RotationSpeed};
 use crate::fan::Color;
 
 /// Step applied to a color channel per key press.
-pub const COLOR_STEP: i16 = 16;
+pub const COLOR_STEP: i16 = 1;
 
 /// A single addressable fan LED, numbered `1..=LED_COUNT`: the number matches
 /// the keyboard key and the label on the ring.

@@ -17,19 +17,15 @@
 //! - `1`..`8` — select the LED to adjust (no fan write needed)
 //! - `a` — toggle "all LEDs" mode: when on, color keys adjust every LED at
 //!   once (off by default)
-//! - `r` / `R` — increase / decrease red (selected LED, or all when toggled)
-//! - `g` / `G` — increase / decrease green
-//! - `b` / `B` — increase / decrease blue
+//! - `r` / `R` — raise / lower red by 1 (selected LED, or all when toggled);
+//!   the color bar's pointer follows the color to the nearest block
+//! - `g` / `G` — raise / lower green by 1
+//! - `b` / `B` — raise / lower blue by 1
 //! - `c` — toggle the target LED (or every LED in all-mode) between off
 //!   (black) and the color it had before
 //! - `Left` / `Right` — move the color bar's pointer one block left / right (it
 //!   wraps around at the ends) and set the target LED (or all LEDs) to that
 //!   block's color; selecting a LED re-points the pointer at the nearest block
-//! - `Shift` + `Left` / `Right` — nudge the target LED (or all LEDs) by 1 in
-//!   each channel the bar's color moves in from the pointed block to the
-//!   adjacent block in that direction (e.g. red → orange raises the green
-//!   value by 1); the pointer stays put until the color reaches that block,
-//!   then it steps one block like `Left` / `Right` (wrapping at the ends)
 //! - `t` — toggle the rotation: while on, the colors shift one position
 //!   around the ring at the current rotation speed (LED 1's color moves to
 //!   LED 8, and so on). While every LED is off the rotation is stopped
@@ -63,7 +59,7 @@ use std::io::{self, Stdout};
 use std::time::{Duration, Instant};
 
 use crossterm::cursor;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -168,25 +164,6 @@ impl ColorBar {
         self.pos = (self.pos + 1) % PALETTE.len();
     }
 
-    /// Move the pointer one block in `direction` (+1 right, -1 left),
-    /// wrapping around at the ends.
-    fn step(&mut self, direction: i32) {
-        if direction > 0 {
-            self.move_right();
-        } else {
-            self.move_left();
-        }
-    }
-
-    /// The block one step `direction` away from the pointer (+1 right,
-    /// -1 left), wrapping around the ends: the block `step` would move the
-    /// pointer to.
-    fn neighbor(&self, direction: i32) -> Color {
-        let mut stepped = *self;
-        stepped.step(direction);
-        stepped.color()
-    }
-
     /// Point the pointer at the block nearest `color`.
     fn set_nearest(&mut self, color: Color) {
         self.pos = PALETTE
@@ -218,15 +195,6 @@ fn color_distance(a: Color, b: Color) -> i32 {
     let dg = i32::from(a.g) - i32::from(b.g);
     let db = i32::from(a.b) - i32::from(b.b);
     dr * dr + dg * dg + db * db
-}
-
-/// +1, -1, or 0: which way a single channel moves from `from` to `to`.
-fn step_direction(from: u8, to: u8) -> i16 {
-    match from.cmp(&to) {
-        std::cmp::Ordering::Less => 1,
-        std::cmp::Ordering::Equal => 0,
-        std::cmp::Ordering::Greater => -1,
-    }
 }
 
 /// State of the TUI.
@@ -303,37 +271,6 @@ impl App {
         self.leds.set_color(self.color_bar.color());
         self.apply(fan);
         self.persist();
-    }
-
-    /// Handle `Shift` + `Left` / `Right`: nudge the target LED (or every LED
-    /// in all-mode) by 1 in each channel the bar's color moves in from the
-    /// pointed block to the adjacent block, so the gesture that jumps a whole
-    /// block can fine-tune by one. The pointer stays put until the nudged
-    /// color reaches that adjacent block (a concrete step), then it steps one
-    /// block like `Left` / `Right`.
-    fn step_color_bar<F: FanController>(&mut self, direction: i32, fan: &F) {
-        // The color may already sit on the adjacent block (e.g. reached with
-        // the r/g/b keys): step the pointer over to it first.
-        if self.leds.selected().color() == self.color_bar.neighbor(direction) {
-            self.color_bar.step(direction);
-        }
-        let from = self.color_bar.color();
-        let to = self.color_bar.neighbor(direction);
-        self.nudge_toward(from, to);
-        // A concrete step was reached: the pointer follows the color.
-        if self.leds.selected().color() == to {
-            self.color_bar.step(direction);
-        }
-        self.apply(fan);
-        self.persist();
-    }
-
-    /// Nudge the target LED (or every LED in all-mode) by 1 in each channel
-    /// the color moves in from `from` to `to`, clamped to 0..=255.
-    fn nudge_toward(&mut self, from: Color, to: Color) {
-        self.leds.adjust(Channel::Red, step_direction(from.r, to.r));
-        self.leds.adjust(Channel::Green, step_direction(from.g, to.g));
-        self.leds.adjust(Channel::Blue, step_direction(from.b, to.b));
     }
 
     /// Push the per-LED colors to the fan, remembering any error for display.
@@ -435,17 +372,6 @@ impl App {
             }
             KeyCode::Up => return self.nudge_speed(SPEED_STEP, fan),
             KeyCode::Down => return self.nudge_speed(-SPEED_STEP, fan),
-            // The fine color step: nudge the target LED(s) by 1 in each
-            // channel the bar's color moves in toward the adjacent block; the
-            // pointer stays put until the color reaches that block.
-            KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                self.step_color_bar(-1, fan);
-                return true;
-            }
-            KeyCode::Right if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                self.step_color_bar(1, fan);
-                return true;
-            }
             // The color bar: move the pointer one block left / right (wrapping
             // around at the ends), then set the target LED(s) to that block's
             // color.
@@ -460,12 +386,32 @@ impl App {
                 return true;
             }
             KeyCode::Char('x') => return self.toggle_auto(fan),
-            KeyCode::Char('r') => self.leds.adjust(Channel::Red, COLOR_STEP),
-            KeyCode::Char('R') => self.leds.adjust(Channel::Red, -COLOR_STEP),
-            KeyCode::Char('g') => self.leds.adjust(Channel::Green, COLOR_STEP),
-            KeyCode::Char('G') => self.leds.adjust(Channel::Green, -COLOR_STEP),
-            KeyCode::Char('b') => self.leds.adjust(Channel::Blue, COLOR_STEP),
-            KeyCode::Char('B') => self.leds.adjust(Channel::Blue, -COLOR_STEP),
+            // A color key changes one channel by 1; the color bar's pointer
+            // then follows the new color to the nearest block.
+            KeyCode::Char('r') => {
+                self.leds.adjust(Channel::Red, COLOR_STEP);
+                self.sync_color_bar();
+            }
+            KeyCode::Char('R') => {
+                self.leds.adjust(Channel::Red, -COLOR_STEP);
+                self.sync_color_bar();
+            }
+            KeyCode::Char('g') => {
+                self.leds.adjust(Channel::Green, COLOR_STEP);
+                self.sync_color_bar();
+            }
+            KeyCode::Char('G') => {
+                self.leds.adjust(Channel::Green, -COLOR_STEP);
+                self.sync_color_bar();
+            }
+            KeyCode::Char('b') => {
+                self.leds.adjust(Channel::Blue, COLOR_STEP);
+                self.sync_color_bar();
+            }
+            KeyCode::Char('B') => {
+                self.leds.adjust(Channel::Blue, -COLOR_STEP);
+                self.sync_color_bar();
+            }
             // Toggle the target LED (or every LED in all-mode) between off
             // (black) and its previous color.
             KeyCode::Char('c') => self.leds.toggle_off(),
@@ -1011,8 +957,6 @@ fn footer(app: &App) -> Paragraph<'static> {
         Span::raw("off "),
         Span::styled(" ←→ ", Style::default().fg(RColor::Cyan)),
         Span::raw("color "),
-        Span::styled(" ⇧←→ ", Style::default().fg(RColor::Cyan)),
-        Span::raw("fine "),
         Span::styled(" ↑↓ ", Style::default().fg(RColor::Cyan)),
         Span::raw("spd "),
         Span::styled(" x ", Style::default().fg(RColor::Cyan)),
@@ -1069,6 +1013,7 @@ fn footer(app: &App) -> Paragraph<'static> {
 mod tests {
     use super::*;
     use crate::fan::speed::{HIGH_SPEED, LOW_SPEED};
+    use crossterm::event::KeyModifiers;
     use ratatui::backend::TestBackend;
 
     /// A bank with every LED red, as the frame tests below assume.
@@ -1079,11 +1024,6 @@ mod tests {
     /// A key press event without modifiers, for `handle_key`.
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
-    }
-
-    /// A key press event with Shift held, for `handle_key`.
-    fn shift_key(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::SHIFT)
     }
 
     /// The 8 LED positions all sit on the ring and are well separated.
@@ -2095,190 +2035,61 @@ mod tests {
         assert_eq!(fan.writes.get(), 1, "the new color is written to the fan");
     }
 
-    /// Shift+Right nudges the target LED by 1 in each channel the bar's color
-    /// moves in (red → orange: green up 1, red and blue untouched), and the
-    /// pointer stays put until the color reaches the next block.
+    /// `r`/`R` raise / lower red by 1 per press (not a coarse step), and each
+    /// press writes the fan.
     #[test]
-    fn shift_right_nudges_by_one_and_keeps_the_pointer_put() {
+    fn rgb_keys_change_the_selected_channel_by_one() {
+        let fan = CountingFan::default();
+        let mut app = App::new(red_bank());
+        assert_eq!(
+            app.leds.selected().color(),
+            Color::new(255, 0, 0),
+            "the selected LED starts red"
+        );
+
+        assert!(
+            app.handle_key(key(KeyCode::Char('R')), &fan),
+            "R keeps the app running"
+        );
+        assert_eq!(
+            app.leds.selected().color(),
+            Color::new(254, 0, 0),
+            "R lowers red by 1"
+        );
+        assert!(
+            app.handle_key(key(KeyCode::Char('r')), &fan),
+            "r keeps the app running"
+        );
+        assert_eq!(
+            app.leds.selected().color(),
+            Color::new(255, 0, 0),
+            "r raises red by 1"
+        );
+        assert_eq!(fan.writes.get(), 2, "each press writes the fan");
+    }
+
+    /// A color key re-points the color bar's pointer at the block nearest the
+    /// new color: 200 lowers take red (255, 0, 0) to (55, 0, 0), and the
+    /// pointer jumps to the nearest block, black.
+    #[test]
+    fn rgb_keys_point_the_bar_at_the_nearest_block() {
         let fan = CountingFan::default();
         let mut app = App::new(red_bank());
         assert_eq!(app.color_bar.pos, 11, "the pointer starts at the red block");
 
-        assert!(
-            app.handle_key(shift_key(KeyCode::Right), &fan),
-            "Shift+Right keeps the app running"
-        );
-        assert_eq!(
-            app.leds.selected().color(),
-            Color::new(255, 1, 0),
-            "red toward orange raises the green value by 1"
-        );
-        assert_eq!(
-            app.color_bar.pos,
-            11,
-            "the pointer stays on red until the color reaches orange"
-        );
-        assert_eq!(fan.writes.get(), 1, "the nudged color is written to the fan");
-    }
-
-    /// Shift+Left nudges toward the previous block (red → rose: blue up 1),
-    /// keeping the pointer put.
-    #[test]
-    fn shift_left_nudges_by_one_toward_the_previous_block() {
-        let fan = CountingFan::default();
-        let mut app = App::new(red_bank());
-
-        assert!(
-            app.handle_key(shift_key(KeyCode::Left), &fan),
-            "Shift+Left keeps the app running"
-        );
-        assert_eq!(
-            app.leds.selected().color(),
-            Color::new(255, 0, 1),
-            "red toward rose raises the blue value by 1"
-        );
-        assert_eq!(
-            app.color_bar.pos,
-            11,
-            "the pointer stays on red until the color reaches rose"
-        );
-    }
-
-    /// The pointer steps one block exactly when the nudged color reaches the
-    /// adjacent block: 122 Shift+Rights take red to orange, and the pointer
-    /// steps over on the 122nd press.
-    #[test]
-    fn the_pointer_steps_when_the_next_block_is_reached() {
-        let fan = CountingFan::default();
-        let mut app = App::new(red_bank());
-
-        for _ in 0..121 {
-            assert!(app.handle_key(shift_key(KeyCode::Right), &fan));
-        }
-        assert_eq!(app.color_bar.pos, 11, "the pointer has not stepped yet");
-        assert_eq!(
-            app.leds.selected().color(),
-            Color::new(255, 121, 0),
-            "one short of orange"
-        );
-
-        assert!(app.handle_key(shift_key(KeyCode::Right), &fan));
-        assert_eq!(
-            app.leds.selected().color(),
-            Color::new(255, 122, 0),
-            "the color reaches orange"
-        );
-        assert_eq!(
-            app.color_bar.pos,
-            12,
-            "reaching the block steps the pointer over to it"
-        );
-    }
-
-    /// The nudge also lowers a channel: from yellow toward chartreuse the red
-    /// value drops by 1 per press.
-    #[test]
-    fn shift_right_lowers_the_channel_the_block_moves_down_in() {
-        let fan = CountingFan::default();
-        let mut app = App::new(LedBank::from_colors([Color::new(255, 255, 0); LED_COUNT]));
-        assert_eq!(app.color_bar.pos, 13, "the pointer starts at the yellow block");
-
-        assert!(app.handle_key(shift_key(KeyCode::Right), &fan));
-        assert_eq!(
-            app.leds.selected().color(),
-            Color::new(254, 255, 0),
-            "yellow toward chartreuse lowers the red value by 1"
-        );
-    }
-
-    /// A step that moves two channels by different amounts (122, 122, 122 →
-    /// 122, 0, 255) moves green down and blue up by 1 per press; the shorter
-    /// channel clamps at its target, and the pointer steps when the color
-    /// reaches the block.
-    #[test]
-    fn a_two_channel_step_clamps_the_shorter_channel_and_steps_at_the_block() {
-        let fan = CountingFan::default();
-        let mut app = App::new(LedBank::from_colors([Color::new(122, 122, 122); LED_COUNT]));
-        assert_eq!(app.color_bar.pos, 7, "the pointer starts at the gray block");
-
-        for _ in 0..133 {
-            assert!(app.handle_key(shift_key(KeyCode::Right), &fan));
+        for _ in 0..200 {
+            assert!(app.handle_key(key(KeyCode::Char('R')), &fan));
         }
         assert_eq!(
             app.leds.selected().color(),
-            Color::new(122, 0, 255),
-            "both channels reached the block (green clamped at 0)"
-        );
-        assert_eq!(
-            app.color_bar.pos,
-            8,
-            "the pointer stepped to the reached block"
-        );
-    }
-
-    /// The fine step wraps around the ends of the bar, and the pointer steps
-    /// over when the color reaches the wrapped block.
-    #[test]
-    fn shift_right_wraps_around_the_bar() {
-        let fan = CountingFan::default();
-        let mut app = App::new(LedBank::from_colors([Color::WHITE; LED_COUNT]));
-        assert_eq!(
-            app.color_bar.pos,
-            PALETTE.len() - 1,
-            "the pointer starts on the white block"
-        );
-
-        for _ in 0..255 {
-            assert!(app.handle_key(shift_key(KeyCode::Right), &fan));
-        }
-        assert_eq!(
-            app.leds.selected().color(),
-            Color::BLACK,
-            "white toward black lowers every value by 1 per press"
+            Color::new(55, 0, 0),
+            "200 R presses lower red from 255 to 55"
         );
         assert_eq!(
             app.color_bar.pos,
             0,
-            "reaching black wraps the pointer to the first block"
+            "the pointer jumps to the nearest block (black)"
         );
-    }
-
-    /// If the color already sits on the adjacent block (e.g. reached with the
-    /// r/g/b keys), the pointer steps over to it, and the nudge then heads
-    /// toward the following block.
-    #[test]
-    fn the_pointer_catches_up_to_a_color_already_on_the_next_block() {
-        let fan = CountingFan::default();
-        let mut app = App::new(LedBank::from_colors([Color::new(255, 0, 122); LED_COUNT]));
-        assert_eq!(app.color_bar.pos, 10, "the pointer starts at the rose block");
-        app.leds.set_color(Color::new(255, 0, 0)); // drifted onto the next block
-
-        assert!(app.handle_key(shift_key(KeyCode::Right), &fan));
-        assert_eq!(
-            app.color_bar.pos,
-            11,
-            "the pointer steps over to the block the color already is"
-        );
-        assert_eq!(
-            app.leds.selected().color(),
-            Color::new(255, 1, 0),
-            "the nudge then heads toward the following block (green up 1)"
-        );
-    }
-
-    /// In all-mode the fine step nudges every LED, keeping the pointer put.
-    #[test]
-    fn shift_right_nudges_every_led_in_all_mode() {
-        let fan = CountingFan::default();
-        let mut app = App::new(red_bank());
-        app.leds.toggle_all();
-        assert!(app.leds.all_mode());
-
-        assert!(app.handle_key(shift_key(KeyCode::Right), &fan));
-        for color in app.leds.colors() {
-            assert_eq!(color, Color::new(255, 1, 0), "every LED is nudged");
-        }
-        assert_eq!(app.color_bar.pos, 11, "the pointer stays put");
     }
 
     /// `c` blacks out the selected LED and writes the fan; the other LEDs are
