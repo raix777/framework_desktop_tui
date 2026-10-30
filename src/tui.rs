@@ -25,6 +25,11 @@
 //! - `Left` / `Right` — move the color bar's pointer one block left / right (it
 //!   wraps around at the ends) and set the target LED (or all LEDs) to that
 //!   block's color; selecting a LED re-points the pointer at the nearest block
+//! - `Shift` + `Left` / `Right` — nudge the target LED (or all LEDs) by 1 in
+//!   each channel the bar's color moves in from the pointed block to the
+//!   adjacent block in that direction (e.g. red → orange raises the green
+//!   value by 1); the pointer stays put until the color reaches that block,
+//!   then it steps one block like `Left` / `Right` (wrapping at the ends)
 //! - `t` — toggle the rotation: while on, the colors shift one position
 //!   around the ring at the current rotation speed (LED 1's color moves to
 //!   LED 8, and so on). While every LED is off the rotation is stopped
@@ -58,7 +63,7 @@ use std::io::{self, Stdout};
 use std::time::{Duration, Instant};
 
 use crossterm::cursor;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -157,6 +162,25 @@ impl ColorBar {
         self.pos = (self.pos + 1) % PALETTE.len();
     }
 
+    /// Move the pointer one block in `direction` (+1 right, -1 left),
+    /// wrapping around at the ends.
+    fn step(&mut self, direction: i32) {
+        if direction > 0 {
+            self.move_right();
+        } else {
+            self.move_left();
+        }
+    }
+
+    /// The block one step `direction` away from the pointer (+1 right,
+    /// -1 left), wrapping around the ends: the block `step` would move the
+    /// pointer to.
+    fn neighbor(&self, direction: i32) -> Color {
+        let mut stepped = *self;
+        stepped.step(direction);
+        stepped.color()
+    }
+
     /// Point the pointer at the block nearest `color`.
     fn set_nearest(&mut self, color: Color) {
         self.pos = PALETTE
@@ -188,6 +212,15 @@ fn color_distance(a: Color, b: Color) -> i32 {
     let dg = i32::from(a.g) - i32::from(b.g);
     let db = i32::from(a.b) - i32::from(b.b);
     dr * dr + dg * dg + db * db
+}
+
+/// +1, -1, or 0: which way a single channel moves from `from` to `to`.
+fn step_direction(from: u8, to: u8) -> i16 {
+    match from.cmp(&to) {
+        std::cmp::Ordering::Less => 1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => -1,
+    }
 }
 
 /// State of the TUI.
@@ -266,6 +299,37 @@ impl App {
         self.persist();
     }
 
+    /// Handle `Shift` + `Left` / `Right`: nudge the target LED (or every LED
+    /// in all-mode) by 1 in each channel the bar's color moves in from the
+    /// pointed block to the adjacent block, so the gesture that jumps a whole
+    /// block can fine-tune by one. The pointer stays put until the nudged
+    /// color reaches that adjacent block (a concrete step), then it steps one
+    /// block like `Left` / `Right`.
+    fn step_color_bar<F: FanController>(&mut self, direction: i32, fan: &F) {
+        // The color may already sit on the adjacent block (e.g. reached with
+        // the r/g/b keys): step the pointer over to it first.
+        if self.leds.selected().color() == self.color_bar.neighbor(direction) {
+            self.color_bar.step(direction);
+        }
+        let from = self.color_bar.color();
+        let to = self.color_bar.neighbor(direction);
+        self.nudge_toward(from, to);
+        // A concrete step was reached: the pointer follows the color.
+        if self.leds.selected().color() == to {
+            self.color_bar.step(direction);
+        }
+        self.apply(fan);
+        self.persist();
+    }
+
+    /// Nudge the target LED (or every LED in all-mode) by 1 in each channel
+    /// the color moves in from `from` to `to`, clamped to 0..=255.
+    fn nudge_toward(&mut self, from: Color, to: Color) {
+        self.leds.adjust(Channel::Red, step_direction(from.r, to.r));
+        self.leds.adjust(Channel::Green, step_direction(from.g, to.g));
+        self.leds.adjust(Channel::Blue, step_direction(from.b, to.b));
+    }
+
     /// Push the per-LED colors to the fan, remembering any error for display.
     fn apply<F: FanController>(&mut self, fan: &F) {
         self.error = fan
@@ -329,8 +393,8 @@ impl App {
     }
 
     /// Handle a key press. Returns `false` when the app should quit.
-    fn handle_key<F: FanController>(&mut self, code: KeyCode, fan: &F) -> bool {
-        match code {
+    fn handle_key<F: FanController>(&mut self, key: KeyEvent, fan: &F) -> bool {
+        match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return false,
             // Selecting a LED only changes the target of future color keys; it
             // does not change the fan, so no write is needed. It re-points the
@@ -365,6 +429,17 @@ impl App {
             }
             KeyCode::Up => return self.nudge_speed(SPEED_STEP, fan),
             KeyCode::Down => return self.nudge_speed(-SPEED_STEP, fan),
+            // The fine color step: nudge the target LED(s) by 1 in each
+            // channel the bar's color moves in toward the adjacent block; the
+            // pointer stays put until the color reaches that block.
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.step_color_bar(-1, fan);
+                return true;
+            }
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.step_color_bar(1, fan);
+                return true;
+            }
             // The color bar: move the pointer one block left / right (wrapping
             // around at the ends), then set the target LED(s) to that block's
             // color.
@@ -566,7 +641,7 @@ fn run_loop<F: FanController>(
         {
             let was_rotating = app.leds.rotation_on();
             let was_speed: RotationSpeed = app.leds.rotation_speed();
-            if !app.handle_key(key.code, fan) {
+            if !app.handle_key(key, fan) {
                 break;
             }
             let is_rotating = app.leds.rotation_on();
@@ -930,6 +1005,8 @@ fn footer(app: &App) -> Paragraph<'static> {
         Span::raw("off "),
         Span::styled(" ←→ ", Style::default().fg(RColor::Cyan)),
         Span::raw("color "),
+        Span::styled(" ⇧←→ ", Style::default().fg(RColor::Cyan)),
+        Span::raw("fine "),
         Span::styled(" ↑↓ ", Style::default().fg(RColor::Cyan)),
         Span::raw("spd "),
         Span::styled(" x ", Style::default().fg(RColor::Cyan)),
@@ -991,6 +1068,16 @@ mod tests {
     /// A bank with every LED red, as the frame tests below assume.
     fn red_bank() -> LedBank {
         LedBank::from_colors([Color::new(255, 0, 0); LED_COUNT])
+    }
+
+    /// A key press event without modifiers, for `handle_key`.
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// A key press event with Shift held, for `handle_key`.
+    fn shift_key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::SHIFT)
     }
 
     /// The 8 LED positions all sit on the ring and are well separated.
@@ -1297,7 +1384,7 @@ mod tests {
 
         assert!(!app.leds.rotation_on(), "rotation starts off");
         assert!(
-            app.handle_key(KeyCode::Char('t'), &fan),
+            app.handle_key(key(KeyCode::Char('t')), &fan),
             "t keeps the app running"
         );
         assert!(app.leds.rotation_on(), "t turns the rotation on");
@@ -1308,7 +1395,7 @@ mod tests {
         );
 
         assert!(
-            app.handle_key(KeyCode::Char('s'), &fan),
+            app.handle_key(key(KeyCode::Char('s')), &fan),
             "s keeps the app running"
         );
         assert_eq!(
@@ -1317,7 +1404,7 @@ mod tests {
             "s flips the direction"
         );
 
-        assert!(app.handle_key(KeyCode::Char('t'), &fan));
+        assert!(app.handle_key(key(KeyCode::Char('t')), &fan));
         assert!(!app.leds.rotation_on(), "t turns the rotation off again");
 
         assert_eq!(fan.writes.get(), 0, "t and s must not write the fan");
@@ -1331,7 +1418,7 @@ mod tests {
         let mut app = App::new(LedBank::from_colors([Color::BLACK; LED_COUNT]));
 
         assert!(
-            app.handle_key(KeyCode::Char('s'), &fan),
+            app.handle_key(key(KeyCode::Char('s')), &fan),
             "s keeps the app running"
         );
         assert_eq!(
@@ -1339,8 +1426,8 @@ mod tests {
             RotationDirection::Clockwise,
             "s does not flip the direction while all off"
         );
-        assert!(app.handle_key(KeyCode::Char('+'), &fan), "+ keeps the app running");
-        assert!(app.handle_key(KeyCode::Char('-'), &fan), "- keeps the app running");
+        assert!(app.handle_key(key(KeyCode::Char('+')), &fan), "+ keeps the app running");
+        assert!(app.handle_key(key(KeyCode::Char('-')), &fan), "- keeps the app running");
         assert_eq!(
             app.leds.rotation_speed().hertz(),
             1.0,
@@ -1394,15 +1481,15 @@ mod tests {
         assert_eq!(app.leds.rotation_speed().hertz(), 1.0, "the default speed");
 
         assert!(
-            app.handle_key(KeyCode::Char('+'), &fan),
+            app.handle_key(key(KeyCode::Char('+')), &fan),
             "+ keeps the app running"
         );
         assert_eq!(app.leds.rotation_speed().hertz(), 2.0, "+ raises the speed by 1 hz");
         assert!(
-            app.handle_key(KeyCode::Char('-'), &fan),
+            app.handle_key(key(KeyCode::Char('-')), &fan),
             "- keeps the app running"
         );
-        assert!(app.handle_key(KeyCode::Char('-'), &fan));
+        assert!(app.handle_key(key(KeyCode::Char('-')), &fan));
         assert_eq!(
             app.leds.rotation_speed().hertz(),
             0.9,
@@ -1461,7 +1548,7 @@ mod tests {
         let mut app = App::new(red_bank());
 
         assert!(
-            app.handle_key(KeyCode::Up, &fan),
+            app.handle_key(key(KeyCode::Up), &fan),
             "Up keeps the app running"
         );
         assert_eq!(
@@ -1475,7 +1562,7 @@ mod tests {
             "the first Up jumps to the high speed"
         );
         assert!(
-            app.handle_key(KeyCode::Down, &fan),
+            app.handle_key(key(KeyCode::Down), &fan),
             "Down keeps the app running"
         );
         assert_eq!(
@@ -1505,12 +1592,12 @@ mod tests {
         let mut app = app_with_speed(50);
 
         assert!(
-            app.handle_key(KeyCode::Up, &fan),
+            app.handle_key(key(KeyCode::Up), &fan),
             "Up keeps the app running"
         );
         assert_eq!(app.speed.percent(), 53, "Up raises the speed by 3%");
         assert!(
-            app.handle_key(KeyCode::Down, &fan),
+            app.handle_key(key(KeyCode::Down), &fan),
             "Down keeps the app running"
         );
         assert_eq!(app.speed.percent(), 50, "Down lowers the speed by 3%");
@@ -1535,7 +1622,7 @@ mod tests {
         let fan = CountingFan::default();
 
         let mut at_top = app_with_speed(100);
-        assert!(at_top.handle_key(KeyCode::Up, &fan));
+        assert!(at_top.handle_key(key(KeyCode::Up), &fan));
         assert_eq!(at_top.speed.percent(), 100, "the speed cannot go above 100");
         assert!(
             fan.speeds.borrow().is_empty(),
@@ -1543,7 +1630,7 @@ mod tests {
         );
 
         let mut at_bottom = app_with_speed(0);
-        assert!(at_bottom.handle_key(KeyCode::Down, &fan));
+        assert!(at_bottom.handle_key(key(KeyCode::Down), &fan));
         assert_eq!(at_bottom.speed.percent(), 0, "the speed cannot go below 0");
         assert!(
             fan.speeds.borrow().is_empty(),
@@ -1559,7 +1646,7 @@ mod tests {
         let mut app = app_with_speed(67);
 
         assert!(
-            app.handle_key(KeyCode::Char('x'), &fan),
+            app.handle_key(key(KeyCode::Char('x')), &fan),
             "x keeps the app running"
         );
         assert_eq!(
@@ -1577,7 +1664,7 @@ mod tests {
             "handing over writes no speed"
         );
 
-        assert!(app.handle_key(KeyCode::Char('x'), &fan));
+        assert!(app.handle_key(key(KeyCode::Char('x')), &fan));
         assert_eq!(
             app.speed.state(),
             SpeedState::Manual,
@@ -1595,18 +1682,18 @@ mod tests {
     /// (`Down`), and writes it to the fan (overriding the auto control).
     #[test]
     fn arrow_keys_jump_to_high_or_low_speed_from_auto() {
-        for (key, expected) in [(KeyCode::Up, HIGH_SPEED), (KeyCode::Down, LOW_SPEED)] {
+        for (code, expected) in [(KeyCode::Up, HIGH_SPEED), (KeyCode::Down, LOW_SPEED)] {
             let fan = CountingFan::default();
             let mut app = app_with_speed(67);
             // Hand the speed to the EC: manual -> auto.
-            app.handle_key(KeyCode::Char('x'), &fan);
+            app.handle_key(key(KeyCode::Char('x')), &fan);
             assert_eq!(
                 app.speed.state(),
                 SpeedState::Auto,
                 "x switches to the auto control"
             );
 
-            assert!(app.handle_key(key, &fan), "the arrow keeps the app running");
+            assert!(app.handle_key(key(code), &fan), "the arrow keeps the app running");
             assert_eq!(
                 app.speed.state(),
                 SpeedState::Manual,
@@ -1928,7 +2015,7 @@ mod tests {
         assert_eq!(app.color_bar.pos, 1, "the pointer starts at the selected red");
 
         assert!(
-            app.handle_key(KeyCode::Right, &fan),
+            app.handle_key(key(KeyCode::Right), &fan),
             "Right keeps the app running"
         );
         assert_eq!(app.color_bar.pos, 2, "the pointer moves one block right");
@@ -1949,7 +2036,7 @@ mod tests {
         assert_eq!(app.color_bar.pos, 0, "the pointer is on the first block");
 
         assert!(
-            app.handle_key(KeyCode::Left, &fan),
+            app.handle_key(key(KeyCode::Left), &fan),
             "Left keeps the app running"
         );
         assert_eq!(
@@ -1974,7 +2061,7 @@ mod tests {
         assert!(app.leds.all_mode());
 
         assert!(
-            app.handle_key(KeyCode::Right, &fan),
+            app.handle_key(key(KeyCode::Right), &fan),
             "Right keeps the app running"
         );
         let color = app.color_bar.color();
@@ -1982,6 +2069,191 @@ mod tests {
             assert_eq!(led_color, color, "every LED takes the block's color");
         }
         assert_eq!(fan.writes.get(), 1, "the new color is written to the fan");
+    }
+
+    /// Shift+Right nudges the target LED by 1 in each channel the bar's color
+    /// moves in (red → orange: green up 1, red and blue untouched), and the
+    /// pointer stays put until the color reaches the next block.
+    #[test]
+    fn shift_right_nudges_by_one_and_keeps_the_pointer_put() {
+        let fan = CountingFan::default();
+        let mut app = App::new(red_bank());
+        assert_eq!(app.color_bar.pos, 1, "the pointer starts at the red block");
+
+        assert!(
+            app.handle_key(shift_key(KeyCode::Right), &fan),
+            "Shift+Right keeps the app running"
+        );
+        assert_eq!(
+            app.leds.selected().color(),
+            Color::new(255, 1, 0),
+            "red toward orange raises the green value by 1"
+        );
+        assert_eq!(
+            app.color_bar.pos,
+            1,
+            "the pointer stays on red until the color reaches orange"
+        );
+        assert_eq!(fan.writes.get(), 1, "the nudged color is written to the fan");
+    }
+
+    /// Shift+Left nudges toward the previous block (red → black: red down 1),
+    /// keeping the pointer put.
+    #[test]
+    fn shift_left_nudges_by_one_toward_the_previous_block() {
+        let fan = CountingFan::default();
+        let mut app = App::new(red_bank());
+
+        assert!(
+            app.handle_key(shift_key(KeyCode::Left), &fan),
+            "Shift+Left keeps the app running"
+        );
+        assert_eq!(
+            app.leds.selected().color(),
+            Color::new(254, 0, 0),
+            "red toward black lowers the red value by 1"
+        );
+        assert_eq!(
+            app.color_bar.pos,
+            1,
+            "the pointer stays on red until the color reaches black"
+        );
+    }
+
+    /// The pointer steps one block exactly when the nudged color reaches the
+    /// adjacent block: 122 Shift+Rights take red to orange, and the pointer
+    /// steps over on the 122nd press.
+    #[test]
+    fn the_pointer_steps_when_the_next_block_is_reached() {
+        let fan = CountingFan::default();
+        let mut app = App::new(red_bank());
+
+        for _ in 0..121 {
+            assert!(app.handle_key(shift_key(KeyCode::Right), &fan));
+        }
+        assert_eq!(app.color_bar.pos, 1, "the pointer has not stepped yet");
+        assert_eq!(
+            app.leds.selected().color(),
+            Color::new(255, 121, 0),
+            "one short of orange"
+        );
+
+        assert!(app.handle_key(shift_key(KeyCode::Right), &fan));
+        assert_eq!(
+            app.leds.selected().color(),
+            Color::new(255, 122, 0),
+            "the color reaches orange"
+        );
+        assert_eq!(
+            app.color_bar.pos,
+            2,
+            "reaching the block steps the pointer over to it"
+        );
+    }
+
+    /// The nudge also lowers a channel: from yellow toward chartreuse the red
+    /// value drops by 1 per press.
+    #[test]
+    fn shift_right_lowers_the_channel_the_block_moves_down_in() {
+        let fan = CountingFan::default();
+        let mut app = App::new(LedBank::from_colors([Color::new(255, 255, 0); LED_COUNT]));
+        assert_eq!(app.color_bar.pos, 3, "the pointer starts at the yellow block");
+
+        assert!(app.handle_key(shift_key(KeyCode::Right), &fan));
+        assert_eq!(
+            app.leds.selected().color(),
+            Color::new(254, 255, 0),
+            "yellow toward chartreuse lowers the red value by 1"
+        );
+    }
+
+    /// A step that moves two channels by different amounts (255, 0, 122 →
+    /// 122, 0, 0) lowers both by 1 per press; the shorter channel clamps at
+    /// its target, and the pointer steps when the color reaches the block.
+    #[test]
+    fn a_two_channel_step_clamps_the_shorter_channel_and_steps_at_the_block() {
+        let fan = CountingFan::default();
+        let mut app = App::new(LedBank::from_colors([Color::new(255, 0, 122); LED_COUNT]));
+        assert_eq!(app.color_bar.pos, 12, "the pointer starts at the block");
+
+        for _ in 0..133 {
+            assert!(app.handle_key(shift_key(KeyCode::Right), &fan));
+        }
+        assert_eq!(
+            app.leds.selected().color(),
+            Color::new(122, 0, 0),
+            "both channels reached the block (blue clamped at 0)"
+        );
+        assert_eq!(
+            app.color_bar.pos,
+            13,
+            "the pointer stepped to the reached block"
+        );
+    }
+
+    /// The fine step wraps around the ends of the bar, and the pointer steps
+    /// over when the color reaches the wrapped block.
+    #[test]
+    fn shift_right_wraps_around_the_bar() {
+        let fan = CountingFan::default();
+        let mut app = App::new(LedBank::from_colors([Color::WHITE; LED_COUNT]));
+        assert_eq!(
+            app.color_bar.pos,
+            PALETTE.len() - 1,
+            "the pointer starts on the white block"
+        );
+
+        for _ in 0..255 {
+            assert!(app.handle_key(shift_key(KeyCode::Right), &fan));
+        }
+        assert_eq!(
+            app.leds.selected().color(),
+            Color::BLACK,
+            "white toward black lowers every value by 1 per press"
+        );
+        assert_eq!(
+            app.color_bar.pos,
+            0,
+            "reaching black wraps the pointer to the first block"
+        );
+    }
+
+    /// If the color already sits on the adjacent block (e.g. reached with the
+    /// r/g/b keys), the pointer steps over to it, and the nudge then heads
+    /// toward the following block.
+    #[test]
+    fn the_pointer_catches_up_to_a_color_already_on_the_next_block() {
+        let fan = CountingFan::default();
+        let mut app = App::new(LedBank::from_colors([Color::new(255, 0, 122); LED_COUNT]));
+        assert_eq!(app.color_bar.pos, 12, "the pointer starts at the block");
+        app.leds.set_color(Color::new(122, 0, 0)); // drifted onto the next block
+
+        assert!(app.handle_key(shift_key(KeyCode::Right), &fan));
+        assert_eq!(
+            app.color_bar.pos,
+            13,
+            "the pointer steps over to the block the color already is"
+        );
+        assert_eq!(
+            app.leds.selected().color(),
+            Color::new(122, 1, 0),
+            "the nudge then heads toward the following block (green up 1)"
+        );
+    }
+
+    /// In all-mode the fine step nudges every LED, keeping the pointer put.
+    #[test]
+    fn shift_right_nudges_every_led_in_all_mode() {
+        let fan = CountingFan::default();
+        let mut app = App::new(red_bank());
+        app.leds.toggle_all();
+        assert!(app.leds.all_mode());
+
+        assert!(app.handle_key(shift_key(KeyCode::Right), &fan));
+        for color in app.leds.colors() {
+            assert_eq!(color, Color::new(255, 1, 0), "every LED is nudged");
+        }
+        assert_eq!(app.color_bar.pos, 1, "the pointer stays put");
     }
 
     /// `c` blacks out the selected LED and writes the fan; the other LEDs are
@@ -1993,7 +2265,7 @@ mod tests {
         app.leds.select(3);
 
         assert!(
-            app.handle_key(KeyCode::Char('c'), &fan),
+            app.handle_key(key(KeyCode::Char('c')), &fan),
             "c keeps the app running"
         );
         let colors = app.leds.colors();
@@ -2019,7 +2291,7 @@ mod tests {
         assert!(app.leds.all_mode());
 
         assert!(
-            app.handle_key(KeyCode::Char('c'), &fan),
+            app.handle_key(key(KeyCode::Char('c')), &fan),
             "c keeps the app running"
         );
         for color in app.leds.colors() {
@@ -2037,7 +2309,7 @@ mod tests {
         app.leds.select(3);
 
         assert!(
-            app.handle_key(KeyCode::Char('c'), &fan),
+            app.handle_key(key(KeyCode::Char('c')), &fan),
             "the first c keeps the app running"
         );
         assert_eq!(
@@ -2046,7 +2318,7 @@ mod tests {
             "the first c blacks out the LED"
         );
         assert!(
-            app.handle_key(KeyCode::Char('c'), &fan),
+            app.handle_key(key(KeyCode::Char('c')), &fan),
             "the second c keeps the app running"
         );
         assert_eq!(
@@ -2073,7 +2345,7 @@ mod tests {
         assert_eq!(app.color_bar.pos, 5, "the pointer starts at the selected green");
 
         assert!(
-            app.handle_key(KeyCode::Char('1'), &fan),
+            app.handle_key(key(KeyCode::Char('1')), &fan),
             "selecting keeps the app running"
         );
         assert_eq!(
