@@ -107,8 +107,24 @@ const VIEW: f64 = 12.0;
 const SELECT_RADIUS: f64 = 1.0;
 
 /// The 27 colors of the color bar, from black (left) to white (right).
+///
+/// The colors between the ends run in three hue rings, each brighter than
+/// the last: the dark colors (red to magenta), then gray as the neutral
+/// bridge, then the full colors (violet to blue), then the light colors
+/// (blue to cyan). Within a ring the hues follow the wheel, and between
+/// two adjacent blocks each channel moves by at most one mid step (133).
 const PALETTE: [Color; 27] = [
     Color::BLACK,
+    Color::new(122, 0, 0),
+    Color::new(122, 122, 0),
+    Color::new(0, 122, 0),
+    Color::new(0, 122, 122),
+    Color::new(0, 0, 122),
+    Color::new(122, 0, 122),
+    Color::new(122, 122, 122),
+    Color::new(122, 0, 255),
+    Color::new(255, 0, 255),
+    Color::new(255, 0, 122),
     Color::new(255, 0, 0),
     Color::new(255, 122, 0),
     Color::new(255, 255, 0),
@@ -118,22 +134,12 @@ const PALETTE: [Color; 27] = [
     Color::new(0, 255, 255),
     Color::new(0, 122, 255),
     Color::new(0, 0, 255),
-    Color::new(122, 0, 255),
-    Color::new(255, 0, 255),
-    Color::new(255, 0, 122),
-    Color::new(122, 0, 0),
-    Color::new(122, 122, 0),
-    Color::new(0, 122, 0),
-    Color::new(0, 122, 122),
-    Color::new(0, 0, 122),
-    Color::new(122, 0, 122),
-    Color::new(122, 122, 122),
-    Color::new(255, 122, 122),
-    Color::new(122, 255, 122),
     Color::new(122, 122, 255),
-    Color::new(122, 255, 255),
     Color::new(255, 122, 255),
+    Color::new(255, 122, 122),
     Color::new(255, 255, 122),
+    Color::new(122, 255, 122),
+    Color::new(122, 255, 255),
     Color::WHITE,
 ];
 
@@ -1955,6 +1961,24 @@ mod tests {
         );
     }
 
+    /// The palette runs from black to white in small steps: between two
+    /// adjacent blocks each channel moves by at most the mid step (133), so
+    /// similar colors sit next to each other (e.g. (0, 122, 255) and
+    /// (122, 122, 255) are separated only by pure blue).
+    #[test]
+    fn adjacent_palette_blocks_are_close_in_color() {
+        for pair in PALETTE.windows(2) {
+            let (left, right) = (pair[0], pair[1]);
+            let dr = i32::from(left.r).abs_diff(i32::from(right.r));
+            let dg = i32::from(left.g).abs_diff(i32::from(right.g));
+            let db = i32::from(left.b).abs_diff(i32::from(right.b));
+            assert!(
+                dr <= 133 && dg <= 133 && db <= 133,
+                "adjacent blocks jump too far: {left:?} -> {right:?}"
+            );
+        }
+    }
+
     /// `move_left`/`move_right` step the pointer one block at a time, wrapping
     /// around the ends of the bar instead of clamping.
     #[test]
@@ -1980,7 +2004,7 @@ mod tests {
     fn set_nearest_points_at_the_nearest_block() {
         let mut bar = ColorBar::new();
         bar.set_nearest(Color::new(0, 255, 0));
-        assert_eq!(bar.pos, 5, "pure green is the green block");
+        assert_eq!(bar.pos, 15, "pure green is the green block");
         bar.set_nearest(Color::new(1, 2, 3));
         assert_eq!(bar.pos, 0, "a near-black color points at black");
         bar.set_nearest(Color::new(254, 254, 254));
@@ -2012,13 +2036,13 @@ mod tests {
     fn right_moves_the_pointer_and_sets_the_selected_led() {
         let fan = CountingFan::default();
         let mut app = App::new(red_bank());
-        assert_eq!(app.color_bar.pos, 1, "the pointer starts at the selected red");
+        assert_eq!(app.color_bar.pos, 11, "the pointer starts at the selected red");
 
         assert!(
             app.handle_key(key(KeyCode::Right), &fan),
             "Right keeps the app running"
         );
-        assert_eq!(app.color_bar.pos, 2, "the pointer moves one block right");
+        assert_eq!(app.color_bar.pos, 12, "the pointer moves one block right");
         assert_eq!(
             app.leds.selected().color(),
             app.color_bar.color(),
@@ -2078,7 +2102,7 @@ mod tests {
     fn shift_right_nudges_by_one_and_keeps_the_pointer_put() {
         let fan = CountingFan::default();
         let mut app = App::new(red_bank());
-        assert_eq!(app.color_bar.pos, 1, "the pointer starts at the red block");
+        assert_eq!(app.color_bar.pos, 11, "the pointer starts at the red block");
 
         assert!(
             app.handle_key(shift_key(KeyCode::Right), &fan),
@@ -2091,13 +2115,13 @@ mod tests {
         );
         assert_eq!(
             app.color_bar.pos,
-            1,
+            11,
             "the pointer stays on red until the color reaches orange"
         );
         assert_eq!(fan.writes.get(), 1, "the nudged color is written to the fan");
     }
 
-    /// Shift+Left nudges toward the previous block (red → black: red down 1),
+    /// Shift+Left nudges toward the previous block (red → rose: blue up 1),
     /// keeping the pointer put.
     #[test]
     fn shift_left_nudges_by_one_toward_the_previous_block() {
@@ -2110,13 +2134,13 @@ mod tests {
         );
         assert_eq!(
             app.leds.selected().color(),
-            Color::new(254, 0, 0),
-            "red toward black lowers the red value by 1"
+            Color::new(255, 0, 1),
+            "red toward rose raises the blue value by 1"
         );
         assert_eq!(
             app.color_bar.pos,
-            1,
-            "the pointer stays on red until the color reaches black"
+            11,
+            "the pointer stays on red until the color reaches rose"
         );
     }
 
@@ -2131,7 +2155,7 @@ mod tests {
         for _ in 0..121 {
             assert!(app.handle_key(shift_key(KeyCode::Right), &fan));
         }
-        assert_eq!(app.color_bar.pos, 1, "the pointer has not stepped yet");
+        assert_eq!(app.color_bar.pos, 11, "the pointer has not stepped yet");
         assert_eq!(
             app.leds.selected().color(),
             Color::new(255, 121, 0),
@@ -2146,7 +2170,7 @@ mod tests {
         );
         assert_eq!(
             app.color_bar.pos,
-            2,
+            12,
             "reaching the block steps the pointer over to it"
         );
     }
@@ -2157,7 +2181,7 @@ mod tests {
     fn shift_right_lowers_the_channel_the_block_moves_down_in() {
         let fan = CountingFan::default();
         let mut app = App::new(LedBank::from_colors([Color::new(255, 255, 0); LED_COUNT]));
-        assert_eq!(app.color_bar.pos, 3, "the pointer starts at the yellow block");
+        assert_eq!(app.color_bar.pos, 13, "the pointer starts at the yellow block");
 
         assert!(app.handle_key(shift_key(KeyCode::Right), &fan));
         assert_eq!(
@@ -2167,26 +2191,27 @@ mod tests {
         );
     }
 
-    /// A step that moves two channels by different amounts (255, 0, 122 →
-    /// 122, 0, 0) lowers both by 1 per press; the shorter channel clamps at
-    /// its target, and the pointer steps when the color reaches the block.
+    /// A step that moves two channels by different amounts (122, 122, 122 →
+    /// 122, 0, 255) moves green down and blue up by 1 per press; the shorter
+    /// channel clamps at its target, and the pointer steps when the color
+    /// reaches the block.
     #[test]
     fn a_two_channel_step_clamps_the_shorter_channel_and_steps_at_the_block() {
         let fan = CountingFan::default();
-        let mut app = App::new(LedBank::from_colors([Color::new(255, 0, 122); LED_COUNT]));
-        assert_eq!(app.color_bar.pos, 12, "the pointer starts at the block");
+        let mut app = App::new(LedBank::from_colors([Color::new(122, 122, 122); LED_COUNT]));
+        assert_eq!(app.color_bar.pos, 7, "the pointer starts at the gray block");
 
         for _ in 0..133 {
             assert!(app.handle_key(shift_key(KeyCode::Right), &fan));
         }
         assert_eq!(
             app.leds.selected().color(),
-            Color::new(122, 0, 0),
-            "both channels reached the block (blue clamped at 0)"
+            Color::new(122, 0, 255),
+            "both channels reached the block (green clamped at 0)"
         );
         assert_eq!(
             app.color_bar.pos,
-            13,
+            8,
             "the pointer stepped to the reached block"
         );
     }
@@ -2225,18 +2250,18 @@ mod tests {
     fn the_pointer_catches_up_to_a_color_already_on_the_next_block() {
         let fan = CountingFan::default();
         let mut app = App::new(LedBank::from_colors([Color::new(255, 0, 122); LED_COUNT]));
-        assert_eq!(app.color_bar.pos, 12, "the pointer starts at the block");
-        app.leds.set_color(Color::new(122, 0, 0)); // drifted onto the next block
+        assert_eq!(app.color_bar.pos, 10, "the pointer starts at the rose block");
+        app.leds.set_color(Color::new(255, 0, 0)); // drifted onto the next block
 
         assert!(app.handle_key(shift_key(KeyCode::Right), &fan));
         assert_eq!(
             app.color_bar.pos,
-            13,
+            11,
             "the pointer steps over to the block the color already is"
         );
         assert_eq!(
             app.leds.selected().color(),
-            Color::new(122, 1, 0),
+            Color::new(255, 1, 0),
             "the nudge then heads toward the following block (green up 1)"
         );
     }
@@ -2253,7 +2278,7 @@ mod tests {
         for color in app.leds.colors() {
             assert_eq!(color, Color::new(255, 1, 0), "every LED is nudged");
         }
-        assert_eq!(app.color_bar.pos, 1, "the pointer stays put");
+        assert_eq!(app.color_bar.pos, 11, "the pointer stays put");
     }
 
     /// `c` blacks out the selected LED and writes the fan; the other LEDs are
@@ -2342,14 +2367,14 @@ mod tests {
         leds.select(3);
         leds.set_color(Color::new(0, 255, 0)); // LED 3 is green, and selected
         let mut app = App::new(leds);
-        assert_eq!(app.color_bar.pos, 5, "the pointer starts at the selected green");
+        assert_eq!(app.color_bar.pos, 15, "the pointer starts at the selected green");
 
         assert!(
             app.handle_key(key(KeyCode::Char('1')), &fan),
             "selecting keeps the app running"
         );
         assert_eq!(
-            app.color_bar.pos, 1,
+            app.color_bar.pos, 11,
             "selecting the red LED re-points the pointer at red"
         );
         assert_eq!(
