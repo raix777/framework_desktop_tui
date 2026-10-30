@@ -7,12 +7,12 @@
 //! colors around the ring (one position every 1/8 s) and `s` to flip the
 //! rotation direction. A vertical bar to the left of the circle shows the fan
 //! speed in percent; the speed is left untouched at startup, `Up`/`Down` take
-//! the fan under manual control (jumping to 75% or 25%, or nudging by 3% once
+//! the fan under manual control (jumping to 75% or 25%, or nudging by 5% once
 //! manual) and `x` toggles the EC's automatic fan control. Under the circle, a
 //! color bar shows a row of fixed color blocks (black on the left, white on the
 //! right); `Left`/`Right` move its pointer one block at a time (wrapping around
 //! at the ends) and set the target LED to that block's color. To the right of the circle, a panel shows the EC's temperature sensors
-//! and fan speeds, refreshed every 10 s. Press `q` to quit.
+//! and fan speeds, refreshed every 2000 ms. Press `q` to quit.
 //!
 //! Requires root and a Framework Desktop:
 //!

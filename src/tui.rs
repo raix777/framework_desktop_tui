@@ -35,7 +35,7 @@
 //! - `+`/`-` — increase / decrease the rotation speed (full rotations per
 //!   second, 0.1 to 10 hz: steps of 0.1 hz below 1 hz, 1 hz above)
 //! - `Up` / `Down` — a vertical bar to the left of the ring shows the speed
-//!   in percent; while the app controls the speed they change it by 3%, and
+//!   in percent; while the app controls the speed they change it by 5%, and
 //!   while it does not (disabled at startup, or the EC's automatic control)
 //!   they take manual control and jump to the high speed (`Up`) or the low
 //!   speed (`Down`)
@@ -45,7 +45,7 @@
 //!
 //! To the right of the ring, a "Thermal" panel shows the EC's temperature
 //! sensors and fan speeds (the same data `framework_tool --thermal` prints),
-//! refreshed every 10 s — a label on the panel's frame states that interval.
+//! refreshed every 2000 ms — the panel's title shows that interval.
 //!
 //! On start the app restores the colors it set last time, so it never
 //! overwrites a lit fan; when every LED is off it lights the fan with a
@@ -83,7 +83,7 @@ use crate::state;
 const POLL_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// How often the thermal data (temperatures and fan speeds) is refreshed.
-const THERMAL_INTERVAL: Duration = Duration::from_secs(10);
+const THERMAL_INTERVAL: Duration = Duration::from_millis(2000);
 
 /// The height of the color bar (rows, including its title and borders): one
 /// row for the RGB/hex readout, one for the color blocks, plus the borders.
@@ -528,8 +528,8 @@ fn run_loop<F: FanController>(
 
     // Read the thermal data once up front so the panel is not empty before the
     // first refresh, and remember when that refresh is due. Each refresh counts
-    // from the previous deadline (not from "now"), so the 10 s cadence does not
-    // drift with frame times.
+    // from the previous deadline (not from "now"), so the 2000 ms cadence does
+    // not drift with frame times.
     app.read_thermal(fan);
     let mut next_thermal = Instant::now() + THERMAL_INTERVAL;
 
@@ -729,15 +729,15 @@ fn draw_speed_bar(frame: &mut Frame, app: &App, area: Rect) {
 
 /// The thermal panel: the present temperature sensors and the fans, each with
 /// its current reading, refreshed every [`THERMAL_INTERVAL`]. The frame carries
-/// a right-aligned label stating that interval, so the reader knows the
-/// readings are not live. Before the first successful read there is nothing to
-/// show but the (empty) frame and its label.
+/// a right-aligned label showing that interval in milliseconds, so the reader
+/// knows the readings are not live. Before the first successful read there is
+/// nothing to show but the (empty) frame and its label.
 fn draw_thermal(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Thermal ")
         .title(
-            Line::from(format!(" updated every {}s", THERMAL_INTERVAL.as_secs()))
+            Line::from(format!(" {}ms", THERMAL_INTERVAL.as_millis()))
                 .alignment(Alignment::Right),
         );
     frame.render_widget(Paragraph::new(thermal_lines(app)).block(block), area);
@@ -1487,7 +1487,7 @@ mod tests {
 
     /// From the disabled state the first `Up` is a shortcut: it takes manual
     /// control and jumps to the high speed (75%), and the next `Down` fine-
-    /// tunes the manual speed back down by 3% (72%).
+    /// tunes the manual speed back down by 5% (70%).
     #[test]
     fn first_arrow_key_jumps_to_the_high_speed() {
         let fan = CountingFan::default();
@@ -1513,13 +1513,13 @@ mod tests {
         );
         assert_eq!(
             app.speed.percent(),
-            HIGH_SPEED - 3,
+            HIGH_SPEED - 5,
             "Down then fine-tunes the manual speed"
         );
 
         assert_eq!(
             fan.speeds.borrow().as_slice(),
-            &[75, 72],
+            &[75, 70],
             "each change writes the new speed to the fan"
         );
         assert_eq!(fan.writes.get(), 0, "the speed keys do not write the LEDs");
@@ -1530,7 +1530,7 @@ mod tests {
         );
     }
 
-    /// In manual mode `Up`/`Down` move the speed by 3% and write it to the
+    /// In manual mode `Up`/`Down` move the speed by 5% and write it to the
     /// fan, without touching the LEDs or the auto control.
     #[test]
     fn arrow_keys_change_the_speed_and_write_the_fan() {
@@ -1541,16 +1541,16 @@ mod tests {
             app.handle_key(key(KeyCode::Up), &fan),
             "Up keeps the app running"
         );
-        assert_eq!(app.speed.percent(), 53, "Up raises the speed by 3%");
+        assert_eq!(app.speed.percent(), 55, "Up raises the speed by 5%");
         assert!(
             app.handle_key(key(KeyCode::Down), &fan),
             "Down keeps the app running"
         );
-        assert_eq!(app.speed.percent(), 50, "Down lowers the speed by 3%");
+        assert_eq!(app.speed.percent(), 50, "Down lowers the speed by 5%");
 
         assert_eq!(
             fan.speeds.borrow().as_slice(),
-            &[53, 50],
+            &[55, 50],
             "each change writes the new speed to the fan"
         );
         assert_eq!(fan.writes.get(), 0, "the speed keys do not write the LEDs");
@@ -1867,10 +1867,11 @@ mod tests {
         assert!(text.contains("2500 RPM"), "the fan speed is shown");
     }
 
-    /// The thermal panel's header carries a right-aligned label stating how
-    /// often the stats refresh, so the reader knows the readings are not live.
+    /// The thermal panel's header carries a right-aligned label showing the
+    /// refresh interval in milliseconds (no "updated every" prefix), so the
+    /// reader knows the readings are not live.
     #[test]
-    fn draw_shows_the_thermal_update_interval() {
+    fn draw_shows_the_thermal_refresh_interval_in_milliseconds() {
         let app = App::new(red_bank());
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("test backend");
         terminal
@@ -1890,10 +1891,14 @@ mod tests {
             .iter()
             .find(|row| row.contains(" Thermal "))
             .expect("the panel's title row");
-        let label = "updated every 10s";
+        assert!(
+            !header.contains("updated every"),
+            "the label has no 'updated every' prefix"
+        );
+        let label = "2000ms";
         let start = header
             .find(label)
-            .expect("the header states the stats are refreshed every 10s");
+            .expect("the header shows the refresh interval in milliseconds");
         let after = &header[start + label.len()..];
         assert!(
             after.trim_end() == "┐",

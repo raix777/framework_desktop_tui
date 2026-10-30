@@ -4,7 +4,7 @@ pub const DEFAULT_SPEED: u8 = 50;
 
 /// The step, in percent, the arrow keys apply to the speed while the fan is
 /// under manual control.
-pub const SPEED_STEP: i8 = 3;
+pub const SPEED_STEP: i8 = 5;
 
 /// The speed `Up` jumps to when it takes manual control from a state the app
 /// does not control (disabled or the EC's automatic control).
@@ -121,7 +121,7 @@ mod tests {
             control.nudge(SPEED_STEP),
             "a nudge in range changes the speed"
         );
-        assert_eq!(control.percent(), 53);
+        assert_eq!(control.percent(), 55);
         assert!(control.nudge(-SPEED_STEP));
         assert_eq!(control.percent(), 50);
     }
@@ -161,14 +161,14 @@ mod tests {
             control.nudge(100);
         }
         assert_eq!(control.percent(), 100, "the speed clamps at 100");
-        assert!(!control.nudge(3), "at 100 the speed cannot go up");
+        assert!(!control.nudge(SPEED_STEP), "at 100 the speed cannot go up");
         assert_eq!(control.percent(), 100);
 
         for _ in 0..40 {
             control.nudge(-100);
         }
         assert_eq!(control.percent(), 0, "the speed clamps at 0");
-        assert!(!control.nudge(-3), "at 0 the speed cannot go down");
+        assert!(!control.nudge(-SPEED_STEP), "at 0 the speed cannot go down");
         assert_eq!(control.percent(), 0);
     }
 
