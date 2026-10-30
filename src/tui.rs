@@ -74,7 +74,8 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{Frame, Terminal};
 
 use crate::fan::{
-    Color, FanController, LED_COUNT, SPEED_STEP, SpeedControl, SpeedState, ThermalSnapshot,
+    Color, FanController, FanError, LED_COUNT, SPEED_STEP, SpeedControl, SpeedState,
+    ThermalSnapshot,
 };
 use crate::led::{COLOR_STEP, Channel, LedBank, RotationDirection, RotationSpeed};
 use crate::state;
@@ -182,10 +183,7 @@ impl ColorBar {
     /// The pointer's color as `RGB(r, g, b)  #rrggbb`.
     fn readout(&self) -> String {
         let c = self.color();
-        format!(
-            "RGB({:3}, {:3}, {:3})  #{:02X}{:02X}{:02X}",
-            c.r, c.g, c.b, c.r, c.g, c.b
-        )
+        format!("{}  #{:02X}{:02X}{:02X}", rgb_readout(c), c.r, c.g, c.b)
     }
 }
 
@@ -195,6 +193,26 @@ fn color_distance(a: Color, b: Color) -> i32 {
     let dg = i32::from(a.g) - i32::from(b.g);
     let db = i32::from(a.b) - i32::from(b.b);
     dr * dr + dg * dg + db * db
+}
+
+/// A color as `RGB(r, g, b)`, each channel right-aligned in three columns.
+fn rgb_readout(color: Color) -> String {
+    format!("RGB({:3}, {:3}, {:3})", color.r, color.g, color.b)
+}
+
+/// The channel and step a color key adjusts by: lowercase raises, uppercase
+/// lowers, each by [`COLOR_STEP`]. `None` for a key that does not adjust a
+/// channel.
+fn color_key(c: char) -> Option<(Channel, i16)> {
+    match c {
+        'r' => Some((Channel::Red, COLOR_STEP)),
+        'R' => Some((Channel::Red, -COLOR_STEP)),
+        'g' => Some((Channel::Green, COLOR_STEP)),
+        'G' => Some((Channel::Green, -COLOR_STEP)),
+        'b' => Some((Channel::Blue, COLOR_STEP)),
+        'B' => Some((Channel::Blue, -COLOR_STEP)),
+        _ => None,
+    }
 }
 
 /// State of the TUI.
@@ -275,10 +293,7 @@ impl App {
 
     /// Push the per-LED colors to the fan, remembering any error for display.
     fn apply<F: FanController>(&mut self, fan: &F) {
-        self.error = fan
-            .write(&self.leds.colors())
-            .err()
-            .map(|err| err.to_string());
+        self.remember_error(fan.write(&self.leds.colors()));
     }
 
     /// Save the current colors so the next run restores them instead of
@@ -290,16 +305,18 @@ impl App {
 
     /// Push the stored speed to the fan, remembering any error for display.
     fn apply_speed<F: FanController>(&mut self, fan: &F) {
-        self.error = fan
-            .set_speed(self.speed.percent())
-            .err()
-            .map(|err| err.to_string());
+        self.remember_error(fan.set_speed(self.speed.percent()));
     }
 
     /// Hand the speed over to the EC's automatic control, remembering any
     /// error for display.
     fn apply_auto_control<F: FanController>(&mut self, fan: &F) {
-        self.error = fan.enable_auto_control().err().map(|err| err.to_string());
+        self.remember_error(fan.enable_auto_control());
+    }
+
+    /// Remember the error of a fan call for display, clearing it on success.
+    fn remember_error(&mut self, result: Result<(), FanError>) {
+        self.error = result.err().map(|err| err.to_string());
     }
 
     /// Read the current thermal data, keeping the last good snapshot. A failed
@@ -386,35 +403,19 @@ impl App {
                 return true;
             }
             KeyCode::Char('x') => return self.toggle_auto(fan),
-            // A color key changes one channel by 1; the color bar's pointer
-            // then follows the new color to the nearest block.
-            KeyCode::Char('r') => {
-                self.leds.adjust(Channel::Red, COLOR_STEP);
-                self.sync_color_bar();
-            }
-            KeyCode::Char('R') => {
-                self.leds.adjust(Channel::Red, -COLOR_STEP);
-                self.sync_color_bar();
-            }
-            KeyCode::Char('g') => {
-                self.leds.adjust(Channel::Green, COLOR_STEP);
-                self.sync_color_bar();
-            }
-            KeyCode::Char('G') => {
-                self.leds.adjust(Channel::Green, -COLOR_STEP);
-                self.sync_color_bar();
-            }
-            KeyCode::Char('b') => {
-                self.leds.adjust(Channel::Blue, COLOR_STEP);
-                self.sync_color_bar();
-            }
-            KeyCode::Char('B') => {
-                self.leds.adjust(Channel::Blue, -COLOR_STEP);
-                self.sync_color_bar();
-            }
             // Toggle the target LED (or every LED in all-mode) between off
             // (black) and its previous color.
             KeyCode::Char('c') => self.leds.toggle_off(),
+            // A color key changes one channel by 1; the color bar's pointer
+            // then follows the new color to the nearest block. Any other key
+            // leaves the fan alone.
+            KeyCode::Char(c) => {
+                let Some((channel, step)) = color_key(c) else {
+                    return true;
+                };
+                self.leds.adjust(channel, step);
+                self.sync_color_bar();
+            }
             _ => return true,
         }
         self.apply(fan);
@@ -553,25 +554,13 @@ fn run_loop<F: FanController>(
             app.leds.rotate();
             app.apply(fan);
             app.persist();
-            let mut next = deadline + interval;
-            // Skip past any intervals that are already in the past (e.g.
-            // after a long sleep) without shifting once per missed tick.
-            while next <= now {
-                next += interval;
-            }
-            next_shift = Some(next);
+            next_shift = Some(next_deadline(deadline, interval, now));
         }
 
         // Refresh the thermal data once its deadline has come.
         if now >= next_thermal {
             app.read_thermal(fan);
-            let mut next = next_thermal + THERMAL_INTERVAL;
-            // Skip past any intervals that are already in the past (e.g.
-            // after a long sleep) without reading once per missed tick.
-            while next <= now {
-                next += THERMAL_INTERVAL;
-            }
-            next_thermal = next;
+            next_thermal = next_deadline(next_thermal, THERMAL_INTERVAL, now);
         }
 
         terminal.draw(|frame| draw(frame, &app))?;
@@ -607,6 +596,17 @@ fn run_loop<F: FanController>(
         }
     }
     Ok(())
+}
+
+/// The next deadline after `deadline`, stepping by `interval` past any
+/// deadlines that are already in the past (e.g. after a long sleep), so the
+/// missed ticks do not all fire one after another.
+fn next_deadline(deadline: Instant, interval: Duration, now: Instant) -> Instant {
+    let mut next = deadline + interval;
+    while next <= now {
+        next += interval;
+    }
+    next
 }
 
 /// The time to wait for the next wake: the next rotation shift (while
@@ -758,10 +758,7 @@ fn thermal_lines(app: &App) -> Vec<Line<'static>> {
         .max()
         .unwrap_or(0);
 
-    let mut lines = vec![Line::from(Span::styled(
-        "Temperatures",
-        Style::default().add_modifier(Modifier::BOLD),
-    ))];
+    let mut lines = vec![heading("Temperatures")];
     for sensor in thermal.sensors() {
         lines.push(reading_line(
             sensor.name(),
@@ -771,10 +768,7 @@ fn thermal_lines(app: &App) -> Vec<Line<'static>> {
         ));
     }
     lines.push(Line::from(" "));
-    lines.push(Line::from(Span::styled(
-        "Fans",
-        Style::default().add_modifier(Modifier::BOLD),
-    )));
+    lines.push(heading("Fans"));
     for fan in thermal.fans() {
         lines.push(reading_line(
             fan.name(),
@@ -796,11 +790,13 @@ fn reading_line(name: &str, value: String, name_width: usize, color: RColor) -> 
     ])
 }
 
-/// Draw the fan: a disc filled with dots in the per-LED wedge colors, a dim
-/// ring, one lit point per LED on the ring, and the LED numbers in their
-/// wedges — each number drawn in the inverse of its wedge's color.
-///
-/// The selected LED is highlighted with a small white ring and a bold number.
+/// A bold section heading for the thermal panel.
+fn heading(text: &'static str) -> Line<'static> {
+    Line::from(Span::styled(text, Style::default().add_modifier(Modifier::BOLD)))
+}
+
+/// The fan ring: a canvas sized so the circle looks round, centered in
+/// `area`.
 fn draw_fan_ring(frame: &mut Frame, app: &App, area: Rect) {
     // Terminal cells are about twice as tall as they are wide, so give the
     // canvas twice as many columns as rows to make the circle look round.
@@ -810,70 +806,77 @@ fn draw_fan_ring(frame: &mut Frame, app: &App, area: Rect) {
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let canvas_area = Rect::new(x, y, width, height);
 
-    let selected_index = app.leds.selected_index();
-    let all_mode = app.leds.all_mode();
-    let colors = app.leds.colors();
     let canvas = Canvas::default()
         .marker(Marker::Dot)
         .x_bounds([-VIEW, VIEW])
         .y_bounds([-VIEW, VIEW])
-        .paint(|ctx| {
-            // The filled disc, drawn first so everything else paints on top.
-            paint_disc(ctx, canvas_area.width, canvas_area.height, &colors);
-
-            // The fan's outer ring, dim so the LEDs stand out.
-            ctx.draw(&Circle {
-                x: 0.0,
-                y: 0.0,
-                radius: RING_RADIUS,
-                color: RColor::DarkGray,
-            });
-
-            // A small white ring around the selected LED, in single-LED mode
-            // only (in all-mode every LED is active, so none is singled out).
-            // Drawn before the LED points so the selected LED's own dot is
-            // painted on top of it.
-            if !all_mode {
-                let (sx, sy) = point_at_radius(RING_RADIUS, led_angle(selected_index));
-                ctx.draw(&Circle {
-                    x: sx,
-                    y: sy,
-                    radius: SELECT_RADIUS,
-                    color: RColor::White,
-                });
-            }
-
-            // One point per LED, each in its own color.
-            for (index, led) in app.leds.indexed() {
-                let (px, py) = point_at_radius(RING_RADIUS, led_angle(index));
-                ctx.draw(&Points {
-                    coords: &[(px, py)],
-                    color: to_ratatui_color(led.color()),
-                });
-            }
-
-            // Number each LED (1..=LED_COUNT) just inside the ring. Each
-            // number sits in its LED's own wedge, so it is drawn in the
-            // inverse of that wedge's color (a red wedge gets a cyan number,
-            // and so on), keeping it readable on any color. The selected
-            // LED's number is bold in single-LED mode.
-            for (index, led) in app.leds.indexed() {
-                let (lx, ly) = point_at_radius(LABEL_RADIUS, led_angle(index));
-                let fg = to_ratatui_color(led.color().inverse());
-                let style = if !all_mode && index == selected_index {
-                    Style::default().fg(fg).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(fg)
-                };
-                ctx.print(
-                    lx,
-                    ly,
-                    Line::from(Span::styled(led.number().to_string(), style)),
-                );
-            }
-        });
+        .paint(|ctx| paint_fan(ctx, app, canvas_area.width, canvas_area.height));
 
     frame.render_widget(canvas, canvas_area);
+}
+
+/// Paint the fan: a disc filled with dots in the per-LED wedge colors, a dim
+/// ring, one lit point per LED on the ring, and the LED numbers in their
+/// wedges — each number drawn in the inverse of its wedge's color.
+///
+/// The selected LED is highlighted with a small white ring and a bold number,
+/// in single-LED mode only.
+fn paint_fan(ctx: &mut Context, app: &App, width: u16, height: u16) {
+    let selected_index = app.leds.selected_index();
+    let all_mode = app.leds.all_mode();
+    let colors = app.leds.colors();
+
+    // The filled disc, drawn first so everything else paints on top.
+    paint_disc(ctx, width, height, &colors);
+
+    // The fan's outer ring, dim so the LEDs stand out.
+    ctx.draw(&Circle {
+        x: 0.0,
+        y: 0.0,
+        radius: RING_RADIUS,
+        color: RColor::DarkGray,
+    });
+
+    // A small white ring around the selected LED, in single-LED mode only
+    // (in all-mode every LED is active, so none is singled out). Drawn before
+    // the LED points so the selected LED's own dot is painted on top of it.
+    if !all_mode {
+        let (sx, sy) = point_at_radius(RING_RADIUS, led_angle(selected_index));
+        ctx.draw(&Circle {
+            x: sx,
+            y: sy,
+            radius: SELECT_RADIUS,
+            color: RColor::White,
+        });
+    }
+
+    // One point per LED, each in its own color.
+    for (index, led) in app.leds.indexed() {
+        let (px, py) = point_at_radius(RING_RADIUS, led_angle(index));
+        ctx.draw(&Points {
+            coords: &[(px, py)],
+            color: to_ratatui_color(led.color()),
+        });
+    }
+
+    // Number each LED (1..=LED_COUNT) just inside the ring. Each number sits
+    // in its LED's own wedge, so it is drawn in the inverse of that wedge's
+    // color (a red wedge gets a cyan number, and so on), keeping it readable
+    // on any color. The selected LED's number is bold in single-LED mode.
+    for (index, led) in app.leds.indexed() {
+        let (lx, ly) = point_at_radius(LABEL_RADIUS, led_angle(index));
+        let fg = to_ratatui_color(led.color().inverse());
+        let style = if !all_mode && index == selected_index {
+            Style::default().fg(fg).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(fg)
+        };
+        ctx.print(
+            lx,
+            ly,
+            Line::from(Span::styled(led.number().to_string(), style)),
+        );
+    }
 }
 
 /// The color bar: a bordered panel with the pointer's color as an RGB and hex
@@ -899,10 +902,8 @@ fn draw_color_bar(frame: &mut Frame, bar: &ColorBar, area: Rect) {
     }
 
     // Block row: one swatch per palette color, split evenly across the width.
-    let (width, count) = (inner.width as usize, PALETTE.len());
     for (index, color) in PALETTE.iter().enumerate() {
-        let start = inner.x + (index * width / count) as u16;
-        let end = inner.x + ((index + 1) * width / count) as u16;
+        let (start, end) = block_edges(index, inner);
         if start == end {
             continue;
         }
@@ -914,12 +915,22 @@ fn draw_color_bar(frame: &mut Frame, bar: &ColorBar, area: Rect) {
 
     // The pointer: an up arrow on the bottom border, centered under the
     // selected block.
-    let start = inner.x + (bar.pos * width / count) as u16;
-    let end = inner.x + ((bar.pos + 1) * width / count) as u16;
+    let (start, end) = block_edges(bar.pos, inner);
     if start < end {
         let column = start + (end - start) / 2;
         buf[(column, inner.y + inner.height)].set_char('▲');
     }
+}
+
+/// The (start, end) columns of palette block `index`, the row in `inner`
+/// split evenly across the palette.
+fn block_edges(index: usize, inner: Rect) -> (u16, u16) {
+    let width = inner.width as usize;
+    let count = PALETTE.len();
+    (
+        inner.x + (index * width / count) as u16,
+        inner.x + ((index + 1) * width / count) as u16,
+    )
 }
 
 /// Title bar: app name, the active target (a LED, or all of them), and its
@@ -937,16 +948,18 @@ fn title(app: &App) -> Paragraph<'static> {
             " Framework Desktop Fan ",
             Style::default().add_modifier(Modifier::BOLD),
         ),
-        Span::raw(format!(
-            " {target}  RGB({:3}, {:3}, {:3})",
-            color.r, color.g, color.b
-        )),
+        Span::raw(format!(" {target}  {}", rgb_readout(color))),
     ]))
 }
 
 /// Footer: key hints on the first line, fan status on the second.
 fn footer(app: &App) -> Paragraph<'static> {
-    let hint = Line::from(vec![
+    Paragraph::new(vec![key_hints(), status_line(app)])
+}
+
+/// The key hints line.
+fn key_hints() -> Line<'static> {
+    Line::from(vec![
         Span::styled(" 1-8 ", Style::default().fg(RColor::Cyan)),
         Span::raw("sel "),
         Span::styled(" a ", Style::default().fg(RColor::Cyan)),
@@ -969,10 +982,13 @@ fn footer(app: &App) -> Paragraph<'static> {
         Span::raw("rspd "),
         Span::styled(" q ", Style::default().fg(RColor::Cyan)),
         Span::raw("quit"),
-    ]);
-    // The rotation state: off, or the direction the colors travel, at the
-    // current speed.
-    let rotation = if app.leds.rotating() {
+    ])
+}
+
+/// The rotation state as reported in the status line: off, or the direction
+/// the colors travel, at the current speed.
+fn rotation_status(app: &App) -> String {
+    let direction = if app.leds.rotating() {
         match app.leds.rotation_direction() {
             RotationDirection::Clockwise => "clockwise",
             RotationDirection::CounterClockwise => "counter-clockwise",
@@ -980,33 +996,31 @@ fn footer(app: &App) -> Paragraph<'static> {
     } else {
         "off"
     };
-    let rotation = format!("{rotation} ({} hz)", app.leds.rotation_speed().hertz());
-    let status = match &app.error {
-        Some(err) => Line::from(Span::styled(
+    format!("{direction} ({} hz)", app.leds.rotation_speed().hertz())
+}
+
+/// The fan status line: the last fan error in red, or the target (a LED, or
+/// all of them), its color, and the rotation state in green.
+fn status_line(app: &App) -> Line<'static> {
+    let rotation = rotation_status(app);
+    if let Some(err) = &app.error {
+        return Line::from(Span::styled(
             format!("fan error: {err}   rotation: {rotation}"),
             Style::default().fg(RColor::Red),
-        )),
-        None => {
-            let selected = app.leds.selected();
-            let color = selected.color();
-            let status = if app.leds.all_mode() {
-                format!(
-                    "fan: {LED_COUNT} LEDs, ALL LEDs  RGB({:3}, {:3}, {:3})   rotation: {rotation}",
-                    color.r, color.g, color.b
-                )
-            } else {
-                format!(
-                    "fan: {LED_COUNT} LEDs, LED {} selected  RGB({:3}, {:3}, {:3})   rotation: {rotation}",
-                    selected.number(),
-                    color.r,
-                    color.g,
-                    color.b
-                )
-            };
-            Line::from(Span::styled(status, Style::default().fg(RColor::Green)))
-        }
+        ));
+    }
+    let selected = app.leds.selected();
+    let color = selected.color();
+    let target = if app.leds.all_mode() {
+        "ALL LEDs".to_string()
+    } else {
+        format!("LED {} selected", selected.number())
     };
-    Paragraph::new(vec![hint, status])
+    let status = format!(
+        "fan: {LED_COUNT} LEDs, {target}  {}   rotation: {rotation}",
+        rgb_readout(color)
+    );
+    Line::from(Span::styled(status, Style::default().fg(RColor::Green)))
 }
 
 #[cfg(test)]
@@ -2234,6 +2248,43 @@ mod tests {
         assert!(
             content.iter().any(|cell| cell.bg == white),
             "the bar includes a white block"
+        );
+    }
+
+    /// A lowercase color key raises its channel, an uppercase one lowers it,
+    /// each by one step; any other key does not adjust a channel.
+    #[test]
+    fn color_key_maps_the_color_keys_to_channel_and_step() {
+        assert_eq!(color_key('r'), Some((Channel::Red, COLOR_STEP)));
+        assert_eq!(color_key('R'), Some((Channel::Red, -COLOR_STEP)));
+        assert_eq!(color_key('g'), Some((Channel::Green, COLOR_STEP)));
+        assert_eq!(color_key('G'), Some((Channel::Green, -COLOR_STEP)));
+        assert_eq!(color_key('b'), Some((Channel::Blue, COLOR_STEP)));
+        assert_eq!(color_key('B'), Some((Channel::Blue, -COLOR_STEP)));
+        assert_eq!(color_key('c'), None, "c toggles off, it does not adjust");
+        assert_eq!(color_key('1'), None, "digit keys only select");
+    }
+
+    /// `next_deadline` keeps an upcoming deadline and steps an overdue one
+    /// past `now` by its interval, skipping the missed ticks.
+    #[test]
+    fn next_deadline_skips_the_deadlines_that_are_already_due() {
+        let now = Instant::now();
+        let interval = Duration::from_millis(100);
+        assert_eq!(
+            next_deadline(now - Duration::from_millis(30), interval, now),
+            now + Duration::from_millis(70),
+            "an upcoming deadline is kept"
+        );
+        assert_eq!(
+            next_deadline(now - interval, interval, now),
+            now + interval,
+            "an exactly due deadline resumes one interval later"
+        );
+        assert_eq!(
+            next_deadline(now - Duration::from_millis(350), interval, now),
+            now + Duration::from_millis(50),
+            "the missed ticks are skipped without firing"
         );
     }
 
