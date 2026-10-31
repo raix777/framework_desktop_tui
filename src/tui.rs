@@ -37,14 +37,18 @@
 //! - `Left` / `Right` — move the color bar's pointer one block left / right (it
 //!   wraps around at the ends) and set the target LED (or all LEDs) to that
 //!   block's color; selecting a LED re-points the pointer at the nearest block
-//! - `t` — toggle the rotation: while on, the colors shift one position
-//!   around the ring at the current rotation speed (LED 1's color moves to
-//!   LED 8, and so on). While no color is lit the rotation is stopped
-//!   (nothing to rotate), and `s` and `+`/`-` do nothing; when a color is lit
-//!   again, the rotation picks up where it left off
-//! - `s` — flip the rotation direction (clockwise ↔ counter-clockwise)
+//! - `t` — toggle the rotation of the layer the color keys are editing:
+//!   while on, that layer's colors shift one position around the ring at that
+//!   layer's rotation speed (LED 1's color moves to LED 8, and so on), while
+//!   the other layer's colors stay put. While no color in the layer is lit
+//!   the rotation is stopped (nothing to rotate), and `s` and `+`/`-` do
+//!   nothing; when a color in the layer is lit again, the rotation picks up
+//!   where it left off
+//! - `s` — flip the rotation direction (clockwise ↔ counter-clockwise) of the
+//!   layer the color keys are editing
 //! - `+`/`-` — increase / decrease the rotation speed (full rotations per
-//!   second, 0.1 to 10 hz: steps of 0.1 hz below 1 hz, 1 hz above)
+//!   second, 0.1 to 10 hz: steps of 0.1 hz below 1 hz, 1 hz above) of the
+//!   layer the color keys are editing
 //! - `Up` / `Down` — a vertical bar to the left of the ring shows the speed
 //!   in percent; while the app controls the speed they change it by 5%, and
 //!   while it does not (disabled at startup, or the EC's automatic control)
@@ -88,9 +92,7 @@ use crate::fan::{
     Color, FanController, FanError, LED_COUNT, SPEED_STEP, SpeedControl, SpeedState,
     ThermalSnapshot,
 };
-use crate::led::{
-    BlinkSpeed, COLOR_STEP, Channel, LedBank, RotationDirection, RotationSpeed,
-};
+use crate::led::{BlinkSpeed, COLOR_STEP, Channel, LedBank, RotationDirection};
 use crate::state;
 
 /// How long the event loop waits for input before redrawing.
@@ -557,13 +559,14 @@ pub fn run<F: FanController>(fan: &F) -> Result<(), Box<dyn std::error::Error>> 
 
 /// The main loop: draw a frame, then wait for input.
 ///
-/// While the color ring is rotating, the loop also shifts the colors one
-/// position at the rotation's current interval (which depends on its speed)
+/// While a color layer is rotating, the loop also shifts that layer's colors
+/// one position at the layer's rotation interval (which depends on its speed)
 /// and writes the fan, so the colors travel around the ring at that speed.
-/// The rotation is stopped while no color is lit (nothing to rotate), so
-/// while the fan is all-black nothing shifts and nothing is written. While
-/// the two-color blink is on, the loop also flips each LED between its two
-/// colors at the blink's current interval and writes the fan.
+/// The two layers rotate independently: while no color in a layer is lit its
+/// rotation is stopped (nothing to rotate), so while a layer is all-black it
+/// shifts nothing. While the two-color blink is on, the loop also flips each
+/// LED between its two colors at the blink's current interval and writes the
+/// fan.
 fn run_loop<F: FanController>(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     fan: &F,
@@ -583,32 +586,46 @@ fn run_loop<F: FanController>(
     app.read_thermal(fan);
     let mut next_thermal = Instant::now() + THERMAL_INTERVAL;
 
-    // While the ring is rotating: the time of the next color shift. Each
-    // shift counts from the previous deadline (not from "now"), so the cadence
-    // does not drift with frame times. `None` while rotation is off.
-    let mut next_shift: Option<Instant> = None;
+    // While a layer is rotating: the time of that layer's next color shift.
+    // Each shift counts from the previous deadline (not from "now"), so the
+    // cadence does not drift with frame times. `None` while that layer's
+    // rotation is off.
+    let mut next_shift_main: Option<Instant> = None;
+    let mut next_shift_secondary: Option<Instant> = None;
 
     // While the blink is on: the time of the next color change. `None` while
     // the blink is off.
     let mut next_blink: Option<Instant> = None;
 
     loop {
-        // The rotation's and the blink's current intervals (from their rates).
-        let interval = app.leds.rotation_speed().interval();
+        // The current intervals of the two layers' rotations (from their
+        // speeds) and of the blink (from its rate).
+        let main_interval = app.leds.rotation_speed(false).interval();
+        let secondary_interval = app.leds.rotation_speed(true).interval();
         let blink_interval = app.leds.blink_speed().interval();
 
-        // Shift the colors once the ring's deadline has come. While no color
-        // is lit the rotation is stopped, so nothing shifts (or writes the
-        // fan) until a color is lit again.
+        // Shift each layer's colors once its deadline has come. While no
+        // color in a layer is lit its rotation is stopped, so nothing shifts
+        // (or writes the fan) from it until a color in the layer is lit
+        // again.
         let now = Instant::now();
-        if let Some(deadline) = next_shift
-            && app.leds.rotating()
+        if let Some(deadline) = next_shift_main
+            && app.leds.rotating(false)
             && now >= deadline
         {
-            app.leds.rotate();
+            app.leds.rotate_layer(false);
             app.apply(fan);
             app.persist();
-            next_shift = Some(next_deadline(deadline, interval, now));
+            next_shift_main = Some(next_deadline(deadline, main_interval, now));
+        }
+        if let Some(deadline) = next_shift_secondary
+            && app.leds.rotating(true)
+            && now >= deadline
+        {
+            app.leds.rotate_layer(true);
+            app.apply(fan);
+            app.persist();
+            next_shift_secondary = Some(next_deadline(deadline, secondary_interval, now));
         }
 
         // Change every LED's color once the blink's deadline has come. The
@@ -631,14 +648,15 @@ fn run_loop<F: FanController>(
 
         terminal.draw(|frame| draw(frame, &app))?;
 
-        // Wait for input or for the next deadline (a rotation shift, a blink
-        // step, or the thermal refresh), whichever comes first; if nothing is
-        // pending, just redraw on the next tick.
+        // Wait for input or for the next deadline (a layer's rotation shift,
+        // a blink step, or the thermal refresh), whichever comes first; if
+        // nothing is pending, just redraw on the next tick.
         let wait = next_wait(
-            next_shift,
-            app.leds.rotating(),
-            next_blink,
-            app.leds.blink_on(),
+            [
+                (next_shift_main, app.leds.rotating(false)),
+                (next_shift_secondary, app.leds.rotating(true)),
+                (next_blink, app.leds.blink_on()),
+            ],
             next_thermal,
             Instant::now(),
         );
@@ -648,22 +666,30 @@ fn run_loop<F: FanController>(
         if let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
         {
-            let was_rotating = app.leds.rotation_on();
-            let was_speed: RotationSpeed = app.leds.rotation_speed();
+            // Each layer's rotation state before the key: (on, speed), so the
+            // loop can tell which layer's shift deadline must reset.
+            let was_main = (app.leds.rotation_on(false), app.leds.rotation_speed(false));
+            let was_secondary = (app.leds.rotation_on(true), app.leds.rotation_speed(true));
             let was_blinking = app.leds.blink_on();
             let was_blink_speed: BlinkSpeed = app.leds.blink_speed();
             if !app.handle_key(key, fan) {
                 break;
             }
-            let is_rotating = app.leds.rotation_on();
-            let is_speed: RotationSpeed = app.leds.rotation_speed();
+            let is_main = (app.leds.rotation_on(false), app.leds.rotation_speed(false));
+            let is_secondary = (app.leds.rotation_on(true), app.leds.rotation_speed(true));
             let is_blinking = app.leds.blink_on();
             let is_blink_speed: BlinkSpeed = app.leds.blink_speed();
-            // The rotation (re)started, stopped, or changed speed: the next
-            // shift is one interval from now at the new speed (or ticking stops
-            // altogether when the rotation is off).
-            if was_rotating != is_rotating || was_speed != is_speed {
-                next_shift = is_rotating.then(|| Instant::now() + is_speed.interval());
+            // The first layer's rotation (re)started, stopped, or changed
+            // speed: the next shift is one interval from now at the new speed
+            // (or ticking stops altogether when the rotation is off).
+            if was_main != is_main {
+                next_shift_main = is_main.0.then(|| Instant::now() + is_main.1.interval());
+            }
+            // The second layer's rotation: same.
+            if was_secondary != is_secondary {
+                next_shift_secondary = is_secondary
+                    .0
+                    .then(|| Instant::now() + is_secondary.1.interval());
             }
             // The blink (re)started, stopped, or changed rate: the next color
             // change is one interval from now at the new rate (or ticking stops
@@ -687,24 +713,21 @@ fn next_deadline(deadline: Instant, interval: Duration, now: Instant) -> Instant
     next
 }
 
-/// The time to wait for the next wake: the soonest of the next rotation shift
-/// (while rotating) and the next blink step (while blinking); when neither is
+/// The time to wait for the next wake: the soonest of the given pending
+/// deadlines (each a deadline and whether it is active), when none is
 /// pending, the poll timeout. The thermal refresh is always considered.
 fn next_wait(
-    next_shift: Option<Instant>,
-    rotating: bool,
-    next_blink: Option<Instant>,
-    blinking: bool,
+    pending: [(Option<Instant>, bool); 3],
     next_thermal: Instant,
     now: Instant,
 ) -> Duration {
-    let pending = [next_shift.filter(|_| rotating), next_blink.filter(|_| blinking)]
+    let wait = pending
         .into_iter()
-        .flatten()
+        .filter_map(|(deadline, active)| deadline.filter(|_| active))
         .min()
         .map(|deadline| deadline.saturating_duration_since(now))
         .unwrap_or(POLL_TIMEOUT);
-    pending.min(next_thermal.saturating_duration_since(now))
+    wait.min(next_thermal.saturating_duration_since(now))
 }
 
 /// Render one frame: title, fan (speed bar and ring), and footer.
@@ -744,7 +767,7 @@ fn draw_fan_column(frame: &mut Frame, app: &App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(8),                 // fan ring
+            Constraint::Min(8),                   // fan ring
             Constraint::Length(COLOR_BAR_HEIGHT), // color bar
         ])
         .split(area);
@@ -819,8 +842,7 @@ fn draw_thermal(frame: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .title(" Thermal ")
         .title(
-            Line::from(format!(" {}ms", THERMAL_INTERVAL.as_millis()))
-                .alignment(Alignment::Right),
+            Line::from(format!(" {}ms", THERMAL_INTERVAL.as_millis())).alignment(Alignment::Right),
         );
     frame.render_widget(Paragraph::new(thermal_lines(app)).block(block), area);
 }
@@ -874,7 +896,10 @@ fn reading_line(name: &str, value: String, name_width: usize, color: RColor) -> 
 
 /// A bold section heading for the thermal panel.
 fn heading(text: &'static str) -> Line<'static> {
-    Line::from(Span::styled(text, Style::default().add_modifier(Modifier::BOLD)))
+    Line::from(Span::styled(
+        text,
+        Style::default().add_modifier(Modifier::BOLD),
+    ))
 }
 
 /// The fan ring: a canvas sized so the circle looks round, centered in
@@ -994,7 +1019,9 @@ fn draw_color_bar(frame: &mut Frame, bar: &ColorBar, area: Rect) {
         }
         let bg = to_ratatui_color(*color);
         for x in start..end {
-            buf[(x, inner.y + 1)].set_char(' ').set_style(Style::default().bg(bg));
+            buf[(x, inner.y + 1)]
+                .set_char(' ')
+                .set_style(Style::default().bg(bg));
         }
     }
 
@@ -1029,7 +1056,11 @@ fn title(app: &App) -> Paragraph<'static> {
     } else {
         format!("LED {}", selected.number())
     };
-    let slot = if app.leds.editing_secondary() { " 2nd" } else { "" };
+    let slot = if app.leds.editing_secondary() {
+        " 2nd"
+    } else {
+        ""
+    };
     Paragraph::new(Line::from(vec![
         Span::styled(
             " Framework Desktop Fan ",
@@ -1080,18 +1111,31 @@ fn key_hints() -> Line<'static> {
     ])
 }
 
-/// The rotation state as reported in the status line: off, or the direction
-/// the colors travel, at the current speed.
+/// The rotation state of the two color layers as reported in the status
+/// line: each layer is off, or the direction its colors travel, at that
+/// layer's speed.
 fn rotation_status(app: &App) -> String {
-    let direction = if app.leds.rotating() {
-        match app.leds.rotation_direction() {
-            RotationDirection::Clockwise => "clockwise",
-            RotationDirection::CounterClockwise => "counter-clockwise",
-        }
-    } else {
-        "off"
+    format!(
+        "1st {}  2nd {}",
+        layer_rotation_status(app, false),
+        layer_rotation_status(app, true)
+    )
+}
+
+/// The rotation state of one color layer: off, or the direction its colors
+/// travel, at that layer's speed.
+fn layer_rotation_status(app: &App, secondary: bool) -> String {
+    if !app.leds.rotating(secondary) {
+        return "off".to_string();
+    }
+    let direction = match app.leds.rotation_direction(secondary) {
+        RotationDirection::Clockwise => "clockwise",
+        RotationDirection::CounterClockwise => "counter-clockwise",
     };
-    format!("{direction} ({} hz)", app.leds.rotation_speed().hertz())
+    format!(
+        "{direction} ({} hz)",
+        app.leds.rotation_speed(secondary).hertz()
+    )
 }
 
 /// The blink state as reported in the status line: off, or on at the current
@@ -1474,21 +1518,32 @@ mod tests {
         }
     }
 
-    /// `t` toggles the rotation and `s` flips its direction, and neither
-    /// writes the fan (the rotation ticks do that instead).
+    /// `t` toggles the rotation of the layer the color keys are editing and
+    /// `s` flips its direction, and neither writes the fan (the rotation
+    /// ticks do that instead).
     #[test]
     fn t_and_s_control_the_rotation_without_a_write() {
         let fan = CountingFan::default();
         let mut app = App::new(red_bank());
 
-        assert!(!app.leds.rotation_on(), "rotation starts off");
+        assert!(
+            !app.leds.rotation_on(false),
+            "the first layer's rotation starts off"
+        );
         assert!(
             app.handle_key(key(KeyCode::Char('t')), &fan),
             "t keeps the app running"
         );
-        assert!(app.leds.rotation_on(), "t turns the rotation on");
+        assert!(
+            app.leds.rotation_on(false),
+            "t turns the first layer's rotation on"
+        );
+        assert!(
+            !app.leds.rotation_on(true),
+            "the second layer's rotation is untouched"
+        );
         assert_eq!(
-            app.leds.rotation_direction(),
+            app.leds.rotation_direction(false),
             RotationDirection::Clockwise,
             "the rotation starts clockwise"
         );
@@ -1498,13 +1553,42 @@ mod tests {
             "s keeps the app running"
         );
         assert_eq!(
-            app.leds.rotation_direction(),
+            app.leds.rotation_direction(false),
             RotationDirection::CounterClockwise,
-            "s flips the direction"
+            "s flips the first layer's direction"
+        );
+        assert_eq!(
+            app.leds.rotation_direction(true),
+            RotationDirection::Clockwise,
+            "s leaves the second layer's direction alone"
         );
 
         assert!(app.handle_key(key(KeyCode::Char('t')), &fan));
-        assert!(!app.leds.rotation_on(), "t turns the rotation off again");
+        assert!(
+            !app.leds.rotation_on(false),
+            "t turns the first layer's rotation off again"
+        );
+
+        // While editing the second color, `t` and `s` act on the second
+        // layer, leaving the first one alone.
+        assert!(app.handle_key(key(KeyCode::Char('m')), &fan));
+        app.leds.set_color(Color::new(0, 1, 0)); // light the second color
+        assert!(app.handle_key(key(KeyCode::Char('t')), &fan));
+        assert!(
+            app.leds.rotation_on(true),
+            "t turns the second layer's rotation on"
+        );
+        assert!(app.handle_key(key(KeyCode::Char('s')), &fan));
+        assert_eq!(
+            app.leds.rotation_direction(true),
+            RotationDirection::CounterClockwise,
+            "s flips the second layer's direction"
+        );
+        assert_eq!(
+            app.leds.rotation_direction(false),
+            RotationDirection::CounterClockwise,
+            "the first layer keeps its (earlier flipped) direction"
+        );
 
         assert_eq!(fan.writes.get(), 0, "t and s must not write the fan");
     }
@@ -1521,19 +1605,29 @@ mod tests {
             "s keeps the app running"
         );
         assert_eq!(
-            app.leds.rotation_direction(),
+            app.leds.rotation_direction(false),
             RotationDirection::Clockwise,
-            "s does not flip the direction while all off"
+            "s does not flip the direction while the edited layer is all black"
         );
-        assert!(app.handle_key(key(KeyCode::Char('+')), &fan), "+ keeps the app running");
-        assert!(app.handle_key(key(KeyCode::Char('-')), &fan), "- keeps the app running");
+        assert!(
+            app.handle_key(key(KeyCode::Char('+')), &fan),
+            "+ keeps the app running"
+        );
+        assert!(
+            app.handle_key(key(KeyCode::Char('-')), &fan),
+            "- keeps the app running"
+        );
         assert_eq!(
-            app.leds.rotation_speed().hertz(),
+            app.leds.rotation_speed(false).hertz(),
             1.0,
-            "the speed is unchanged while all off"
+            "the speed is unchanged while the edited layer is all black"
         );
 
-        assert_eq!(fan.writes.get(), 0, "the disabled keys do not write the fan");
+        assert_eq!(
+            fan.writes.get(),
+            0,
+            "the disabled keys do not write the fan"
+        );
     }
 
     /// The footer reports the rotation as off while every LED is off, even
@@ -1541,8 +1635,8 @@ mod tests {
     #[test]
     fn the_footer_reports_the_rotation_as_off_while_every_led_is_off() {
         let footer_text = |app: &App| {
-            let mut terminal =
-                Terminal::new(TestBackend::new(100, 24)).expect("test backend");
+            // Wide enough for the status line with both layers' rotations.
+            let mut terminal = Terminal::new(TestBackend::new(120, 24)).expect("test backend");
             terminal
                 .draw(|frame| draw(frame, app))
                 .expect("draw should not fail");
@@ -1557,17 +1651,21 @@ mod tests {
 
         let mut stopped = App::new(LedBank::from_colors([Color::BLACK; LED_COUNT]));
         stopped.leds.toggle_rotation();
-        assert!(stopped.leds.rotation_on(), "the toggle is on");
+        assert!(stopped.leds.rotation_on(false), "the toggle is on");
         assert!(
-            footer_text(&stopped).contains("rotation: off"),
-            "the stopped rotation is reported as off"
+            footer_text(&stopped).contains("rotation: 1st off  2nd off"),
+            "the stopped rotations are reported as off"
         );
 
         let mut running = App::new(LedBank::rainbow());
         running.leds.toggle_rotation();
         assert!(
-            footer_text(&running).contains("rotation: clockwise"),
+            footer_text(&running).contains("rotation: 1st clockwise (1 hz)"),
             "a running rotation is reported by its direction"
+        );
+        assert!(
+            footer_text(&running).contains("2nd off"),
+            "the other layer's rotation is off"
         );
     }
 
@@ -1577,25 +1675,42 @@ mod tests {
     fn plus_minus_change_the_rotation_speed_without_a_write() {
         let fan = CountingFan::default();
         let mut app = App::new(red_bank());
-        assert_eq!(app.leds.rotation_speed().hertz(), 1.0, "the default speed");
+        assert_eq!(
+            app.leds.rotation_speed(false).hertz(),
+            1.0,
+            "the default speed"
+        );
 
         assert!(
             app.handle_key(key(KeyCode::Char('+')), &fan),
             "+ keeps the app running"
         );
-        assert_eq!(app.leds.rotation_speed().hertz(), 2.0, "+ raises the speed by 1 hz");
+        assert_eq!(
+            app.leds.rotation_speed(false).hertz(),
+            2.0,
+            "+ raises the first layer's speed by 1 hz"
+        );
         assert!(
             app.handle_key(key(KeyCode::Char('-')), &fan),
             "- keeps the app running"
         );
         assert!(app.handle_key(key(KeyCode::Char('-')), &fan));
         assert_eq!(
-            app.leds.rotation_speed().hertz(),
+            app.leds.rotation_speed(false).hertz(),
             0.9,
-            "- twice lowers the speed into the fine range"
+            "- twice lowers the first layer's speed into the fine range"
+        );
+        assert_eq!(
+            app.leds.rotation_speed(true).hertz(),
+            1.0,
+            "the second layer's speed is untouched"
         );
 
-        assert_eq!(fan.writes.get(), 0, "changing the speed does not write the fan");
+        assert_eq!(
+            fan.writes.get(),
+            0,
+            "changing the speed does not write the fan"
+        );
     }
 
     /// While rotating, one shift per direction moves the colors exactly as
@@ -1607,7 +1722,7 @@ mod tests {
             Color::new((i + 1) as u8, 0, 0)
         })));
         app.leds.toggle_rotation();
-        app.leds.rotate(); // one tick, as the event loop performs it
+        app.leds.rotate_layer(false); // one tick, as the event loop performs it
         app.apply(&fan);
         app.persist();
 
@@ -1625,10 +1740,11 @@ mod tests {
         );
     }
 
-    /// While rotating, a shift moves the second colors around the ring too,
-    /// so the shift is visible while they are being edited.
+    /// While the second layer is rotating, a shift moves the second colors
+    /// around the ring and only them: the first layer's rotation is off, so
+    /// the main colors stay put.
     #[test]
-    fn rotating_tui_shifts_the_second_colors_too() {
+    fn rotating_tui_shifts_only_the_second_layer() {
         let fan = CountingFan::default();
         let mut leds = LedBank::from_colors([Color::BLACK; LED_COUNT]);
         for number in 1..=LED_COUNT as u8 {
@@ -1639,15 +1755,26 @@ mod tests {
         }
         let mut app = App::new(leds);
 
-        app.leds.toggle_rotation();
-        app.leds.rotate(); // one tick, as the event loop performs it
+        app.leds.toggle_editing();
+        app.leds.toggle_rotation(); // the second layer's rotation
+        app.leds.toggle_editing();
+        app.leds.rotate_layer(true); // one tick, as the event loop performs it
         app.apply(&fan);
 
-        let secondaries: Vec<u8> = app.leds.indexed().map(|(_, led)| led.secondary().r).collect();
+        let secondaries: Vec<u8> = app
+            .leds
+            .indexed()
+            .map(|(_, led)| led.secondary().r)
+            .collect();
         assert_eq!(
             secondaries,
             vec![2, 3, 4, 5, 6, 7, 8, 1],
-            "LED 1's second color lands on LED 8, like the main colors"
+            "LED 1's second color lands on LED 8"
+        );
+        assert_eq!(
+            app.leds.colors(),
+            vec![Color::BLACK; LED_COUNT],
+            "the first layer is not rotating, so the main colors stay put"
         );
         assert_eq!(fan.writes.get(), 1, "the rotation tick writes the fan");
     }
@@ -1660,17 +1787,25 @@ mod tests {
     fn m_toggles_which_color_the_color_keys_edit() {
         let fan = CountingFan::default();
         let mut app = App::new(red_bank());
-        assert!(!app.leds.editing_secondary(), "the keys edit the main color by default");
-        assert_eq!(app.color_bar.pos, 11, "the pointer starts at the selected red");
+        assert!(
+            !app.leds.editing_secondary(),
+            "the keys edit the main color by default"
+        );
+        assert_eq!(
+            app.color_bar.pos, 11,
+            "the pointer starts at the selected red"
+        );
 
         assert!(
             app.handle_key(key(KeyCode::Char('m')), &fan),
             "m keeps the app running"
         );
-        assert!(app.leds.editing_secondary(), "m switches to editing the second color");
+        assert!(
+            app.leds.editing_secondary(),
+            "m switches to editing the second color"
+        );
         assert_eq!(
-            app.color_bar.pos,
-            0,
+            app.color_bar.pos, 0,
             "the pointer follows the second color (off, i.e. black)"
         );
         assert_eq!(fan.writes.get(), 0, "m itself does not write the fan");
@@ -1691,7 +1826,10 @@ mod tests {
         );
 
         assert!(app.handle_key(key(KeyCode::Char('m')), &fan));
-        assert!(!app.leds.editing_secondary(), "m returns to editing the main color");
+        assert!(
+            !app.leds.editing_secondary(),
+            "m returns to editing the main color"
+        );
         assert_eq!(fan.writes.get(), 1, "the color key wrote the fan");
     }
 
@@ -1750,7 +1888,11 @@ mod tests {
             app.handle_key(key(KeyCode::Char('p')), &fan),
             "p keeps the app running"
         );
-        assert_eq!(app.leds.blink_speed().hertz(), 2.0, "p raises the rate by 1 hz");
+        assert_eq!(
+            app.leds.blink_speed().hertz(),
+            2.0,
+            "p raises the rate by 1 hz"
+        );
         assert!(
             app.handle_key(key(KeyCode::Char('o')), &fan),
             "o keeps the app running"
@@ -1762,15 +1904,18 @@ mod tests {
             "o twice lowers the rate into the fine range"
         );
 
-        assert_eq!(fan.writes.get(), 0, "changing the rate does not write the fan");
+        assert_eq!(
+            fan.writes.get(),
+            0,
+            "changing the rate does not write the fan"
+        );
     }
 
     /// The footer reports the blink as off by default and on with its rate.
     #[test]
     fn the_footer_reports_the_blink_state() {
         let footer_text = |app: &App| {
-            let mut terminal =
-                Terminal::new(TestBackend::new(100, 24)).expect("test backend");
+            let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("test backend");
             terminal
                 .draw(|frame| draw(frame, app))
                 .expect("draw should not fail");
@@ -1965,7 +2110,10 @@ mod tests {
                 "x switches to the auto control"
             );
 
-            assert!(app.handle_key(key(code), &fan), "the arrow keeps the app running");
+            assert!(
+                app.handle_key(key(code), &fan),
+                "the arrow keeps the app running"
+            );
             assert_eq!(
                 app.speed.state(),
                 SpeedState::Manual,
@@ -2131,34 +2279,55 @@ mod tests {
         assert!(!text.contains("RPM"), "no fan data before the first read");
     }
 
-    /// `next_wait` returns the soonest of the rotation shift, the blink step,
-    /// the thermal refresh, and the poll timeout.
+    /// `next_wait` returns the soonest of the two layers' rotation shifts,
+    /// the blink step, the thermal refresh, and the poll timeout. The
+    /// pending array is (first layer, second layer, blink).
     #[test]
     fn next_wait_picks_the_soonest_deadline() {
+        let none = (None, false);
         let now = Instant::now();
         let shift = Duration::from_millis(125); // the default rotation interval
         let blink = Duration::from_secs(1); // the default blink interval
         assert_eq!(
-            next_wait(None, false, None, false, now + Duration::from_secs(10), now),
+            next_wait([none, none, none], now + Duration::from_secs(10), now),
             POLL_TIMEOUT,
             "when idle, wait the poll timeout"
         );
         assert_eq!(
-            next_wait(None, false, None, false, now + Duration::from_millis(50), now),
+            next_wait([none, none, none], now + Duration::from_millis(50), now),
             Duration::from_millis(50),
             "a soon thermal refresh waits less"
         );
         assert_eq!(
-            next_wait(Some(now + shift), true, None, false, now + Duration::from_secs(10), now),
+            next_wait(
+                [(Some(now + shift), true), none, none],
+                now + Duration::from_secs(10),
+                now
+            ),
             shift,
-            "while rotating, wait the shift interval"
+            "while the first layer rotates, wait its shift interval"
         );
         assert_eq!(
             next_wait(
-                None,
-                false,
-                Some(now + blink),
-                true,
+                [none, (Some(now + shift), true), none],
+                now + Duration::from_secs(10),
+                now
+            ),
+            shift,
+            "while the second layer rotates, wait its shift interval"
+        );
+        assert_eq!(
+            next_wait(
+                [(Some(now + blink), true), (Some(now + shift), true), none],
+                now + Duration::from_secs(10),
+                now
+            ),
+            shift,
+            "the soonest of the two layers' shifts wins"
+        );
+        assert_eq!(
+            next_wait(
+                [none, none, (Some(now + blink), true)],
                 now + Duration::from_secs(10),
                 now
             ),
@@ -2166,16 +2335,17 @@ mod tests {
             "while blinking, wait the blink interval"
         );
         assert_eq!(
-            next_wait(Some(now + shift), true, None, false, now + Duration::from_millis(50), now),
+            next_wait(
+                [(Some(now + shift), true), none, none],
+                now + Duration::from_millis(50),
+                now
+            ),
             Duration::from_millis(50),
             "a soon thermal refresh beats the next shift"
         );
         assert_eq!(
             next_wait(
-                None,
-                false,
-                Some(now + blink),
-                true,
+                [none, none, (Some(now + blink), true)],
                 now + Duration::from_millis(50),
                 now
             ),
@@ -2184,10 +2354,7 @@ mod tests {
         );
         assert_eq!(
             next_wait(
-                Some(now + shift),
-                true,
-                Some(now + blink),
-                true,
+                [(Some(now + shift), true), none, (Some(now + blink), true)],
                 now + Duration::from_secs(10),
                 now
             ),
@@ -2196,10 +2363,7 @@ mod tests {
         );
         assert_eq!(
             next_wait(
-                Some(now - Duration::from_secs(1)),
-                true,
-                None,
-                false,
+                [(Some(now - Duration::from_secs(1)), true), none, none],
                 now + Duration::from_secs(10),
                 now
             ),
@@ -2330,7 +2494,11 @@ mod tests {
     fn color_and_readout_follow_the_pointer() {
         let mut bar = ColorBar::new();
         bar.set_nearest(Color::new(0, 255, 0));
-        assert_eq!(bar.color(), Color::new(0, 255, 0), "the green block is green");
+        assert_eq!(
+            bar.color(),
+            Color::new(0, 255, 0),
+            "the green block is green"
+        );
         assert_eq!(bar.readout(), "RGB(  0, 255,   0)  #00FF00");
         bar.move_left();
         assert_eq!(
@@ -2346,7 +2514,10 @@ mod tests {
     fn right_moves_the_pointer_and_sets_the_selected_led() {
         let fan = CountingFan::default();
         let mut app = App::new(red_bank());
-        assert_eq!(app.color_bar.pos, 11, "the pointer starts at the selected red");
+        assert_eq!(
+            app.color_bar.pos, 11,
+            "the pointer starts at the selected red"
+        );
 
         assert!(
             app.handle_key(key(KeyCode::Right), &fan),
@@ -2456,8 +2627,7 @@ mod tests {
             "200 R presses lower red from 255 to 55"
         );
         assert_eq!(
-            app.color_bar.pos,
-            0,
+            app.color_bar.pos, 0,
             "the pointer jumps to the nearest block (black)"
         );
     }
@@ -2582,7 +2752,11 @@ mod tests {
             "c keeps the app running"
         );
         for (_, led) in app.leds.indexed() {
-            assert_eq!(led.secondary(), Color::BLACK, "the second color is blacked out");
+            assert_eq!(
+                led.secondary(),
+                Color::BLACK,
+                "the second color is blacked out"
+            );
             assert_eq!(
                 led.color(),
                 Color::new(255, 0, 0),
@@ -2618,11 +2792,7 @@ mod tests {
             Color::new(255, 0, 0),
             "the second c restores the previous color"
         );
-        assert_eq!(
-            fan.writes.get(),
-            2,
-            "each press writes the fan"
-        );
+        assert_eq!(fan.writes.get(), 2, "each press writes the fan");
     }
 
     /// Selecting a LED re-points the pointer at the block nearest that LED's
@@ -2634,7 +2804,10 @@ mod tests {
         leds.select(3);
         leds.set_color(Color::new(0, 255, 0)); // LED 3 is green, and selected
         let mut app = App::new(leds);
-        assert_eq!(app.color_bar.pos, 15, "the pointer starts at the selected green");
+        assert_eq!(
+            app.color_bar.pos, 15,
+            "the pointer starts at the selected green"
+        );
 
         assert!(
             app.handle_key(key(KeyCode::Char('1')), &fan),

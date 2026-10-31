@@ -17,13 +17,17 @@
 //!   ring, regardless of the selected LED or all-mode, remembering the
 //!   previous colors); off, the previous colors are restored
 //! - `a` — toggle all-mode: color changes apply to every LED
-//! - `t` — toggle the rotation: the colors travel around the ring, one
-//!   position per step (the TUI steps them at the current rotation speed while
-//!   it is on); while no color is lit the rotation is stopped
-//! - `s` — flip the rotation direction ([`RotationDirection`]); does nothing
-//!   while no color is lit
-//! - `+`/`-` — increase / decrease the rotation speed ([`RotationSpeed`]),
-//!   from 0.1 to 10 hz; does nothing while no color is lit
+//! - `t` — toggle the rotation of the layer the color keys are editing: that
+//!   layer's colors travel around the ring, one position per step (the TUI
+//!   steps them at that layer's rotation speed while it is on), while the
+//!   other layer's colors stay put; while no color in the layer is lit the
+//!   rotation is stopped
+//! - `s` — flip the rotation direction ([`RotationDirection`]) of the layer
+//!   the color keys are editing; does nothing while that layer has no lit
+//!   color
+//! - `+`/`-` — increase / decrease the rotation speed ([`RotationSpeed`]) of
+//!   the layer the color keys are editing, from 0.1 to 10 hz; does nothing
+//!   while that layer has no lit color
 //! - `m` — toggle which of the LED's two colors the color keys are editing:
 //!   the main color or the second one (off by default, editing the main color)
 //! - `n` — toggle the two-color blink: while on, every LED changes between its
@@ -32,10 +36,11 @@
 //!
 //! Each LED holds two colors: the main color (shown while the blink is off)
 //! and a second color it blinks to while the blink is on. `c` and the
-//! rainbow preset act on whichever color the color keys are editing; the
-//! rotation moves both colors of a LED around the ring together. The second
-//! color starts off (black), so a blink runs between the main color and off
-//! until it is set.
+//! rainbow preset act on whichever color the color keys are editing. The
+//! rotation is per layer: each color layer has its own rotation (on/off,
+//! direction, and speed), controlled while that layer is being edited, and
+//! it moves only its own colors around the ring. The second color starts off
+//! (black), so a blink runs between the main color and off until it is set.
 
 mod bank;
 mod blink;
@@ -45,7 +50,7 @@ mod rotation;
 pub use bank::LedBank;
 pub use blink::BlinkSpeed;
 pub use channel::Channel;
-pub use rotation::{RotationDirection, RotationSpeed};
+pub use rotation::RotationDirection;
 
 use crate::fan::Color;
 
@@ -173,11 +178,19 @@ mod tests {
 
         led.set_secondary(Color::new(0, 0, 255));
         assert_eq!(led.secondary(), Color::new(0, 0, 255));
-        assert_eq!(led.color(), Color::new(255, 0, 0), "the main color is untouched");
+        assert_eq!(
+            led.color(),
+            Color::new(255, 0, 0),
+            "the main color is untouched"
+        );
 
         led.adjust_secondary(Channel::Green, 16);
         assert_eq!(led.secondary(), Color::new(0, 16, 255));
-        assert_eq!(led.color(), Color::new(255, 0, 0), "adjusting it leaves the main color alone");
+        assert_eq!(
+            led.color(),
+            Color::new(255, 0, 0),
+            "adjusting it leaves the main color alone"
+        );
     }
 
     /// `toggle_off` blacks out a lit LED, remembering its color; toggling
@@ -217,8 +230,16 @@ mod tests {
         led.set_secondary(Color::new(0, 0, 255));
 
         led.toggle_off_secondary();
-        assert_eq!(led.secondary(), Color::BLACK, "a lit second color is blacked out");
-        assert_eq!(led.color(), Color::new(255, 0, 0), "the main color is untouched");
+        assert_eq!(
+            led.secondary(),
+            Color::BLACK,
+            "a lit second color is blacked out"
+        );
+        assert_eq!(
+            led.color(),
+            Color::new(255, 0, 0),
+            "the main color is untouched"
+        );
 
         led.toggle_off_secondary();
         assert_eq!(
@@ -226,7 +247,11 @@ mod tests {
             Color::new(0, 0, 255),
             "toggling again restores the second color"
         );
-        assert_eq!(led.color(), Color::new(255, 0, 0), "the main color is still untouched");
+        assert_eq!(
+            led.color(),
+            Color::new(255, 0, 0),
+            "the main color is still untouched"
+        );
     }
 
     /// A black second color that the toggle never turned off has no
@@ -240,6 +265,10 @@ mod tests {
             Color::BLACK,
             "no remembered color means nothing to restore"
         );
-        assert_eq!(led.color(), Color::new(255, 0, 0), "the main color is untouched");
+        assert_eq!(
+            led.color(),
+            Color::new(255, 0, 0),
+            "the main color is untouched"
+        );
     }
 }

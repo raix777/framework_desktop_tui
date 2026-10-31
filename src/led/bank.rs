@@ -1,7 +1,7 @@
 use super::Led;
 use super::blink::BlinkSpeed;
 use super::channel::Channel;
-use super::rotation::{RotationDirection, RotationSpeed};
+use super::rotation::{LayerRotation, RotationDirection, RotationSpeed};
 use crate::fan::{Color, LED_COUNT};
 
 /// The full set of fan LEDs plus the currently selected one.
@@ -12,9 +12,11 @@ use crate::fan::{Color, LED_COUNT};
 ///
 /// Each LED has two colors: the main color and a second one it blinks to. The
 /// color keys, `c`, and the rainbow preset act on whichever color is active
-/// (the main one by default); the rotation moves both colors of a LED around
-/// the ring together. The two-color blink, while on, makes every LED change
-/// between its two colors at the blink rate.
+/// (the main one by default). The rotation is per layer: each color layer has
+/// its own rotation (on/off, direction, speed), controlled while that layer
+/// is being edited, and it moves only its own colors around the ring. The
+/// two-color blink, while on, makes every LED change between its two colors
+/// at the blink rate.
 #[derive(Debug)]
 pub struct LedBank {
     leds: [Led; LED_COUNT],
@@ -31,9 +33,10 @@ pub struct LedBank {
     phase: bool,
     /// The blink rate (color changes per second) while the blink is on.
     blink_speed: BlinkSpeed,
-    rotation: bool,
-    direction: RotationDirection,
-    rotation_speed: RotationSpeed,
+    /// The rotation of the main colors (the first layer).
+    rotation_main: LayerRotation,
+    /// The rotation of the second colors (the second layer).
+    rotation_secondary: LayerRotation,
     /// The colors in effect in the slot the rainbow preset replaced, and
     /// which slot that was (`true` for the second color), so that toggling
     /// the rainbow off restores them to the slot they came from. `None` while
@@ -49,8 +52,8 @@ fn rainbow_colors() -> [Color; LED_COUNT] {
 
 impl LedBank {
     /// Build a bank from explicit per-LED colors (in ring order). LED 1 is
-    /// selected; all-mode and rotation start off, the rotation at its default
-    /// speed.
+    /// selected; all-mode is off, and both layers' rotations start off at
+    /// their default direction and speed.
     pub fn from_colors(colors: [Color; LED_COUNT]) -> Self {
         let leds = std::array::from_fn(|index| Led::new((index + 1) as u8, colors[index]));
         Self {
@@ -61,9 +64,8 @@ impl LedBank {
             blink: false,
             phase: false,
             blink_speed: BlinkSpeed::new(),
-            rotation: false,
-            direction: RotationDirection::Clockwise,
-            rotation_speed: RotationSpeed::new(),
+            rotation_main: LayerRotation::new(),
+            rotation_secondary: LayerRotation::new(),
             rainbow_previous: None,
         }
     }
@@ -216,7 +218,13 @@ impl LedBank {
     /// The color in the given slot (the second color when `secondary`, the
     /// main one otherwise) of every LED, in ring order.
     fn slot_colors(&self, secondary: bool) -> [Color; LED_COUNT] {
-        self.leds.map(|led| if secondary { led.secondary() } else { led.color() })
+        self.leds.map(|led| {
+            if secondary {
+                led.secondary()
+            } else {
+                led.color()
+            }
+        })
     }
 
     /// Whether the rainbow preset is currently applied.
@@ -254,72 +262,110 @@ impl LedBank {
 }
 
 impl LedBank {
-    /// Whether the colors are rotating around the ring.
-    pub fn rotation_on(&self) -> bool {
-        self.rotation
+    /// Whether the rotation of the given layer is on.
+    pub fn rotation_on(&self, secondary: bool) -> bool {
+        self.rotation_slot(secondary).on()
     }
 
-    /// Toggle the rotation. Returns the new state.
+    /// Whether the rotation of the given layer is running: its toggle is on
+    /// and the layer has a lit color. While the layer is all black the
+    /// rotation is stopped (there is nothing to rotate), and its direction
+    /// and speed controls do nothing.
+    pub fn rotating(&self, secondary: bool) -> bool {
+        self.rotation_slot(secondary).on() && self.slot_lit(secondary)
+    }
+
+    /// Toggle the rotation of the layer the color keys are editing, leaving
+    /// the other layer alone. Returns the new state.
     pub fn toggle_rotation(&mut self) -> bool {
-        self.rotation = !self.rotation;
-        self.rotation
+        self.active_rotation().toggle()
     }
 
-    /// Whether the rotation is running: the toggle is on and at least one
-    /// color (main or second) is lit. While no color is lit the rotation is
-    /// stopped (there is nothing to rotate), and its direction and speed
-    /// controls do nothing.
-    pub fn rotating(&self) -> bool {
-        self.rotation && self.any_lit()
+    /// The direction the given layer's colors travel while rotating
+    /// (clockwise by default).
+    pub fn rotation_direction(&self, secondary: bool) -> RotationDirection {
+        self.rotation_slot(secondary).direction()
     }
 
-    /// The direction the colors travel while rotating (clockwise by default).
-    pub fn rotation_direction(&self) -> RotationDirection {
-        self.direction
-    }
-
-    /// Flip the rotation direction. Does nothing while no color is lit (the
-    /// rotation is then stopped).
+    /// Flip the direction of the rotation of the layer the color keys are
+    /// editing. Does nothing while that layer has no lit color (its rotation
+    /// is then stopped).
     pub fn flip_direction(&mut self) {
-        if self.any_lit() {
-            self.direction = self.direction.flipped();
+        if self.slot_lit(self.editing_secondary) {
+            self.active_rotation().flip_direction();
         }
     }
 
-    /// The current rotation speed (full rotations per second).
-    pub fn rotation_speed(&self) -> RotationSpeed {
-        self.rotation_speed
+    /// The rotation speed of the given layer (full rotations per second).
+    pub fn rotation_speed(&self, secondary: bool) -> RotationSpeed {
+        self.rotation_slot(secondary).speed()
     }
 
-    /// Increase the rotation speed by one step (0.1 hz below 1 hz, 1 hz
-    /// above). Does nothing while no color is lit (the rotation is then
-    /// stopped).
+    /// Increase the rotation speed of the layer the color keys are editing by
+    /// one step (0.1 hz below 1 hz, 1 hz above). Does nothing while that
+    /// layer has no lit color (its rotation is then stopped).
     pub fn increase_rotation_speed(&mut self) {
-        if self.any_lit() {
-            self.rotation_speed.increase();
+        if self.slot_lit(self.editing_secondary) {
+            self.active_rotation().increase_speed();
         }
     }
 
-    /// Decrease the rotation speed by one step (1 hz above 1 hz, 0.1 hz
-    /// below). Does nothing while no color is lit (the rotation is then
-    /// stopped).
+    /// Decrease the rotation speed of the layer the color keys are editing by
+    /// one step (1 hz above 1 hz, 0.1 hz below). Does nothing while that
+    /// layer has no lit color (its rotation is then stopped).
     pub fn decrease_rotation_speed(&mut self) {
-        if self.any_lit() {
-            self.rotation_speed.decrease();
+        if self.slot_lit(self.editing_secondary) {
+            self.active_rotation().decrease_speed();
         }
     }
 
-    /// Shift both colors of every LED one position around the ring, in the
-    /// current direction, so each LED keeps its main and second colors
-    /// together.
-    pub fn rotate(&mut self) {
-        let previous: [(Color, Color); LED_COUNT] =
-            self.leds.map(|led| (led.color(), led.secondary()));
-        for (position, led) in self.leds.iter_mut().enumerate() {
-            let (color, secondary) = previous[self.direction.source_position(position)];
-            led.set_color(color);
-            led.set_secondary(secondary);
+    /// Shift the given layer's colors one position around the ring, in that
+    /// layer's direction, leaving the other layer's colors alone. Does
+    /// nothing while the layer's rotation is not running.
+    pub fn rotate_layer(&mut self, secondary: bool) {
+        if !self.rotating(secondary) {
+            return;
         }
+        let direction = self.rotation_slot(secondary).direction();
+        let previous = self.slot_colors(secondary);
+        for (position, led) in self.leds.iter_mut().enumerate() {
+            let color = previous[direction.source_position(position)];
+            if secondary {
+                led.set_secondary(color);
+            } else {
+                led.set_color(color);
+            }
+        }
+    }
+
+    /// The rotation state of the given layer.
+    fn rotation_slot(&self, secondary: bool) -> &LayerRotation {
+        if secondary {
+            &self.rotation_secondary
+        } else {
+            &self.rotation_main
+        }
+    }
+
+    /// The rotation state of the layer the color keys are editing.
+    fn active_rotation(&mut self) -> &mut LayerRotation {
+        if self.editing_secondary {
+            &mut self.rotation_secondary
+        } else {
+            &mut self.rotation_main
+        }
+    }
+
+    /// Whether any LED has a lit (non-black) color in the given layer.
+    fn slot_lit(&self, secondary: bool) -> bool {
+        self.leds.iter().any(|led| {
+            let color = if secondary {
+                led.secondary()
+            } else {
+                led.color()
+            };
+            color != Color::BLACK
+        })
     }
 }
 
@@ -363,9 +409,7 @@ impl LedBank {
     /// Whether any of the LEDs' colors (main or second) is lit (i.e. not
     /// black).
     pub fn any_lit(&self) -> bool {
-        self.leds
-            .iter()
-            .any(|led| led.color() != Color::BLACK || led.secondary() != Color::BLACK)
+        self.slot_lit(false) || self.slot_lit(true)
     }
 
     /// Iterate the LEDs as `(0-based index, &Led)` in ring order.
@@ -603,7 +647,11 @@ mod tests {
         bank.set_color(Color::new(0, 0, 255)); // LED 2's second color is blue
 
         bank.toggle_off();
-        assert_eq!(bank.leds[1].secondary(), Color::BLACK, "the second color is blacked out");
+        assert_eq!(
+            bank.leds[1].secondary(),
+            Color::BLACK,
+            "the second color is blacked out"
+        );
         assert_eq!(
             bank.leds[1].color(),
             Color::new(255, 0, 0),
@@ -638,165 +686,288 @@ mod tests {
         assert!(!bank.all_mode());
     }
 
-    /// The rotation starts off, travelling clockwise.
+    /// Both layers' rotations start off, travelling clockwise.
     #[test]
-    fn rotation_starts_off_and_clockwise() {
+    fn rotations_start_off_and_clockwise() {
         let bank = LedBank::rainbow();
-        assert!(!bank.rotation_on(), "rotation is off by default");
+        assert!(
+            !bank.rotation_on(false),
+            "the first layer's rotation is off by default"
+        );
+        assert!(
+            !bank.rotation_on(true),
+            "the second layer's rotation is off by default"
+        );
         assert_eq!(
-            bank.rotation_direction(),
+            bank.rotation_direction(false),
             RotationDirection::Clockwise,
             "clockwise is the default direction"
         );
+        assert_eq!(
+            bank.rotation_direction(true),
+            RotationDirection::Clockwise,
+            "the second layer is clockwise too"
+        );
     }
 
-    /// `toggle_rotation` flips the rotation, which starts off.
+    /// `toggle_rotation` flips the rotation of the layer the color keys are
+    /// editing, and leaves the other layer alone.
     #[test]
-    fn toggle_rotation_flips_the_state() {
+    fn toggle_rotation_flips_only_the_edited_layer() {
         let mut bank = LedBank::rainbow();
-        assert!(bank.toggle_rotation(), "first toggle turns it on");
-        assert!(bank.rotation_on());
-        assert!(!bank.toggle_rotation(), "second toggle turns it off");
-        assert!(!bank.rotation_on());
+        assert!(
+            bank.toggle_rotation(),
+            "the first toggle turns the first layer's rotation on"
+        );
+        assert!(bank.rotation_on(false));
+        assert!(!bank.rotation_on(true), "the second layer is untouched");
+
+        bank.toggle_editing();
+        assert!(
+            bank.toggle_rotation(),
+            "the second toggle turns the second layer's rotation on"
+        );
+        assert!(bank.rotation_on(true));
+        assert!(bank.rotation_on(false), "the first layer stays on");
+
+        assert!(
+            !bank.toggle_rotation(),
+            "the third toggle turns the second layer's rotation off"
+        );
+        assert!(!bank.rotation_on(true));
+        assert!(bank.rotation_on(false), "the first layer is still on");
     }
 
-    /// `flip_direction` switches between clockwise and counter-clockwise.
+    /// `flip_direction` flips the direction of the layer the color keys are
+    /// editing, and leaves the other layer alone.
     #[test]
-    fn flip_direction_switches_directions() {
+    fn flip_direction_flips_only_the_edited_layer() {
         let mut bank = LedBank::rainbow();
-        assert_eq!(bank.rotation_direction(), RotationDirection::Clockwise);
+        assert_eq!(bank.rotation_direction(false), RotationDirection::Clockwise);
         bank.flip_direction();
         assert_eq!(
-            bank.rotation_direction(),
-            RotationDirection::CounterClockwise
+            bank.rotation_direction(false),
+            RotationDirection::CounterClockwise,
+            "the first layer flips"
         );
+        assert_eq!(
+            bank.rotation_direction(true),
+            RotationDirection::Clockwise,
+            "the second layer is untouched"
+        );
+
+        bank.toggle_editing();
+        bank.set_color(Color::new(0, 0, 255)); // LED 1's second color is blue (layer lit)
         bank.flip_direction();
-        assert_eq!(bank.rotation_direction(), RotationDirection::Clockwise);
+        assert_eq!(
+            bank.rotation_direction(true),
+            RotationDirection::CounterClockwise,
+            "the second layer flips"
+        );
+        assert_eq!(
+            bank.rotation_direction(false),
+            RotationDirection::CounterClockwise,
+            "the first layer keeps its direction"
+        );
     }
 
-    /// The rotation speed starts at the default (1 hz) and steps up and down
-    /// with the + / - logic (1 hz steps at or above 1 hz).
+    /// A layer's rotation speed starts at the default (1 hz) and steps up and
+    /// down with the + / - logic (1 hz steps at or above 1 hz), while the
+    /// other layer keeps its own speed.
     #[test]
     fn the_rotation_speed_steps_through_the_bank() {
         let mut bank = LedBank::rainbow();
-        assert_eq!(bank.rotation_speed().hertz(), 1.0, "the default speed");
+        assert_eq!(bank.rotation_speed(false).hertz(), 1.0, "the default speed");
         bank.increase_rotation_speed();
-        assert_eq!(bank.rotation_speed().hertz(), 2.0, "+ steps up by 1 hz");
+        assert_eq!(
+            bank.rotation_speed(false).hertz(),
+            2.0,
+            "+ steps up by 1 hz"
+        );
         bank.decrease_rotation_speed();
         bank.decrease_rotation_speed();
-        assert_eq!(bank.rotation_speed().hertz(), 0.9, "- steps down to the fine range");
-    }
-
-    /// `rotating` is true only while the rotation toggle is on and at least
-    /// one LED is lit: an all-off fan has nothing to rotate.
-    #[test]
-    fn rotating_requires_a_lit_led() {
-        let mut bank = LedBank::rainbow();
-        assert!(!bank.rotating(), "rotation is off by default");
-
-        bank.toggle_rotation();
-        assert!(bank.rotating(), "on and lit: running");
-
-        bank.toggle_all();
-        bank.toggle_off(); // every LED black
-        assert!(!bank.any_lit());
-        assert!(bank.rotation_on(), "the toggle stays on ...");
-        assert!(
-            !bank.rotating(),
-            "... but the rotation is stopped while all off"
+        assert_eq!(
+            bank.rotation_speed(false).hertz(),
+            0.9,
+            "- steps down to the fine range"
         );
 
-        bank.toggle_off(); // every LED back to its color
-        assert!(bank.rotating(), "lit again: running again");
+        bank.toggle_editing();
+        bank.set_color(Color::new(0, 255, 0)); // LED 1's second color is green (layer lit)
+        bank.increase_rotation_speed();
+        assert_eq!(
+            bank.rotation_speed(true).hertz(),
+            2.0,
+            "the second layer steps independently"
+        );
+        assert_eq!(
+            bank.rotation_speed(false).hertz(),
+            0.9,
+            "the first layer keeps its speed"
+        );
     }
 
-    /// The rotation runs while only the second colors are lit (every main
-    /// color black), and its direction and speed controls work too.
+    /// `rotating` is true only while a layer's rotation toggle is on and that
+    /// layer has a lit color: a layer that is all black has nothing to
+    /// rotate, even while the other layer is lit.
     #[test]
-    fn rotation_runs_while_only_the_second_colors_are_lit() {
+    fn rotating_requires_a_lit_color_in_the_layer() {
+        let mut bank = LedBank::rainbow();
+        assert!(
+            !bank.rotating(false),
+            "the first layer's rotation is off by default"
+        );
+
+        bank.toggle_rotation();
+        assert!(bank.rotating(false), "on and lit: running");
+
+        bank.toggle_all();
+        bank.toggle_off(); // every main color black
+        assert!(
+            !bank.slot_lit(false),
+            "the first layer is all black (the second is off too)"
+        );
+        assert!(bank.rotation_on(false), "the toggle stays on ...");
+        assert!(
+            !bank.rotating(false),
+            "... but the rotation is stopped while the layer is all black"
+        );
+
+        bank.toggle_off(); // every main color back
+        assert!(bank.rotating(false), "lit again: running again");
+    }
+
+    /// The second layer's rotation runs while only the second colors are lit
+    /// (every main color black), while the first layer's rotation is stopped
+    /// (its layer is all black); the direction and speed controls work for
+    /// the edited layer and leave the other alone.
+    #[test]
+    fn the_second_layer_rotates_while_only_the_second_colors_are_lit() {
         let mut bank = LedBank::from_colors([Color::BLACK; LED_COUNT]);
         bank.toggle_editing();
         bank.toggle_all();
         bank.set_color(Color::new(255, 0, 0)); // every second color is red
         bank.toggle_editing();
 
-        assert!(bank.any_lit(), "a lit second color counts as lit");
+        assert!(bank.slot_lit(true), "a lit second color counts as lit");
+        assert!(!bank.slot_lit(false), "the first layer is not lit");
 
+        bank.toggle_editing();
         bank.toggle_rotation();
-        assert!(bank.rotating(), "the rotation runs on the second colors alone");
-
-        bank.flip_direction();
-        assert_eq!(
-            bank.rotation_direction(),
-            RotationDirection::CounterClockwise,
-            "the direction control works"
+        bank.toggle_editing();
+        assert!(bank.rotation_on(true), "the second layer's rotation is on");
+        assert!(
+            bank.rotating(true),
+            "the second layer's rotation runs on the second colors alone"
         );
+        assert!(
+            !bank.rotating(false),
+            "the first layer's rotation is stopped (its layer is all black)"
+        );
+
+        bank.toggle_editing();
+        bank.flip_direction();
         bank.increase_rotation_speed();
-        assert_eq!(bank.rotation_speed().hertz(), 2.0, "the speed control works");
+        bank.toggle_editing();
+        assert_eq!(
+            bank.rotation_direction(true),
+            RotationDirection::CounterClockwise,
+            "the second layer's direction control works"
+        );
+        assert_eq!(
+            bank.rotation_direction(false),
+            RotationDirection::Clockwise,
+            "the first layer's direction is untouched"
+        );
+        assert_eq!(
+            bank.rotation_speed(true).hertz(),
+            2.0,
+            "the second layer's speed control works"
+        );
     }
 
-    /// The rotation toggle still works while every LED is off: it turns the
-    /// rotation on (stopped) or off, it just cannot run while all off.
+    /// A layer's rotation toggle still works while that layer is all black:
+    /// it turns the rotation on (stopped) or off, it just cannot run while
+    /// the layer is all black.
     #[test]
-    fn toggle_rotation_still_works_while_every_led_is_off() {
+    fn toggle_rotation_still_works_while_the_layer_is_all_black() {
         let mut bank = LedBank::from_colors([Color::BLACK; LED_COUNT]);
-        assert!(bank.toggle_rotation(), "the toggle turns the rotation on");
-        assert!(bank.rotation_on());
-        assert!(!bank.rotating(), "... but it is stopped while all off");
-        assert!(!bank.toggle_rotation(), "the toggle turns it off again");
+        assert!(
+            bank.toggle_rotation(),
+            "the toggle turns the first layer's rotation on"
+        );
+        assert!(bank.rotation_on(false));
+        assert!(
+            !bank.rotating(false),
+            "... but it is stopped while the layer is all black"
+        );
+        assert!(
+            !bank.toggle_rotation(),
+            "the toggle turns the first layer's rotation off again"
+        );
+
+        bank.toggle_editing();
+        assert!(
+            bank.toggle_rotation(),
+            "the second layer's rotation toggles independently"
+        );
+        assert!(bank.rotation_on(true));
     }
 
-    /// `flip_direction` does nothing while every LED is off (the rotation is
-    /// stopped), and works again once a LED is lit.
+    /// `flip_direction` does nothing while the layer the color keys are
+    /// editing is all black (its rotation is stopped), and works again once
+    /// that layer has a lit color.
     #[test]
-    fn flip_direction_is_disabled_while_every_led_is_off() {
+    fn flip_direction_is_disabled_while_the_edited_layer_is_all_black() {
         let mut bank = LedBank::from_colors([Color::BLACK; LED_COUNT]);
         bank.flip_direction();
         assert_eq!(
-            bank.rotation_direction(),
+            bank.rotation_direction(false),
             RotationDirection::Clockwise,
-            "no flip while all off"
+            "no flip while the edited layer is all black"
         );
 
         bank.select(1);
-        bank.set_color(Color::new(255, 0, 0));
+        bank.set_color(Color::new(255, 0, 0)); // the first layer is lit
         bank.flip_direction();
         assert_eq!(
-            bank.rotation_direction(),
+            bank.rotation_direction(false),
             RotationDirection::CounterClockwise,
-            "flips again once a LED is lit"
+            "flips again once the edited layer is lit"
         );
     }
 
-    /// The rotation speed does not change while every LED is off (the
-    /// rotation is stopped), and steps again once a LED is lit.
+    /// The rotation speed of the layer the color keys are editing does not
+    /// change while that layer is all black (its rotation is stopped), and
+    /// steps again once the layer has a lit color.
     #[test]
-    fn rotation_speed_is_disabled_while_every_led_is_off() {
+    fn rotation_speed_is_disabled_while_the_edited_layer_is_all_black() {
         let mut bank = LedBank::from_colors([Color::BLACK; LED_COUNT]);
         bank.increase_rotation_speed();
         bank.decrease_rotation_speed();
         assert_eq!(
-            bank.rotation_speed().hertz(),
+            bank.rotation_speed(false).hertz(),
             1.0,
-            "unchanged while all off"
+            "unchanged while the edited layer is all black"
         );
 
         bank.select(1);
-        bank.set_color(Color::new(255, 0, 0));
+        bank.set_color(Color::new(255, 0, 0)); // the first layer is lit
         bank.increase_rotation_speed();
         assert_eq!(
-            bank.rotation_speed().hertz(),
+            bank.rotation_speed(false).hertz(),
             2.0,
-            "steps up again once a LED is lit"
+            "steps up again once the edited layer is lit"
         );
     }
 
-    /// Clockwise: each color moves to the previous LED's position (LED 1's
-    /// wraps around to LED 8).
+    /// Clockwise: each color of the layer moves to the previous LED's
+    /// position (LED 1's wraps around to LED 8).
     #[test]
     fn rotate_clockwise_moves_every_color_to_the_previous_position() {
         let mut bank = distinct_bank();
-        bank.rotate();
+        bank.toggle_rotation();
+        bank.rotate_layer(false);
 
         let reds: Vec<u8> = bank.colors().iter().map(|color| color.r).collect();
         assert_eq!(
@@ -807,13 +978,14 @@ mod tests {
         );
     }
 
-    /// Counter-clockwise: each color moves to the next LED's position (LED
-    /// 8's wraps around to LED 1).
+    /// Counter-clockwise: each color of the layer moves to the next LED's
+    /// position (LED 8's wraps around to LED 1).
     #[test]
     fn rotate_counter_clockwise_moves_every_color_to_the_next_position() {
         let mut bank = distinct_bank();
+        bank.toggle_rotation();
         bank.flip_direction();
-        bank.rotate();
+        bank.rotate_layer(false);
 
         let reds: Vec<u8> = bank.colors().iter().map(|color| color.r).collect();
         assert_eq!(
@@ -824,33 +996,86 @@ mod tests {
         );
     }
 
-    /// `rotate` moves both colors of every LED one position around the ring,
-    /// so each LED keeps its main and second colors together.
+    /// `rotate_layer` shifts only the layer it is given: one step of the
+    /// first layer's rotation moves the main colors and leaves the second
+    /// colors where they are.
     #[test]
-    fn rotate_moves_both_colors_of_every_led_together() {
+    fn rotate_layer_shifts_only_its_own_layer() {
         let mut bank = distinct_bank();
         for (index, led) in bank.leds.iter_mut().enumerate() {
             led.set_secondary(Color::new((index + 2) as u8, 0, 0));
         }
 
-        bank.rotate();
+        bank.toggle_rotation();
+        bank.rotate_layer(false);
 
         let primaries: Vec<u8> = bank.colors().iter().map(|color| color.r).collect();
         let secondaries: Vec<u8> = bank.leds.iter().map(|led| led.secondary().r).collect();
         assert_eq!(
             primaries,
             vec![2, 3, 4, 5, 6, 7, 8, 1],
-            "the main colors shift clockwise"
+            "the first layer's colors shift clockwise"
         );
         assert_eq!(
             secondaries,
-            vec![3, 4, 5, 6, 7, 8, 9, 2],
-            "the second colors shift with them"
+            vec![2, 3, 4, 5, 6, 7, 8, 9],
+            "the second layer's colors are untouched"
         );
     }
 
-    /// Eight shifts (one full turn) bring every color back to where it
-    /// started, in both directions.
+    /// The two layers rotate independently: each layer shifts in its own
+    /// direction at its own pace.
+    #[test]
+    fn the_layers_rotate_in_their_own_directions() {
+        let mut bank = distinct_bank();
+        for (index, led) in bank.leds.iter_mut().enumerate() {
+            led.set_secondary(Color::new((index + 2) as u8, 0, 0));
+        }
+        bank.toggle_rotation(); // the first layer's rotation (clockwise)
+        bank.toggle_editing();
+        bank.flip_direction(); // the second layer goes counter-clockwise
+        bank.toggle_rotation(); // the second layer's rotation
+        assert!(bank.rotating(false), "the first layer runs");
+        assert!(bank.rotating(true), "the second layer runs");
+
+        bank.rotate_layer(false);
+        bank.rotate_layer(true);
+
+        let primaries: Vec<u8> = bank.colors().iter().map(|color| color.r).collect();
+        let secondaries: Vec<u8> = bank.leds.iter().map(|led| led.secondary().r).collect();
+        assert_eq!(
+            primaries,
+            vec![2, 3, 4, 5, 6, 7, 8, 1],
+            "the first layer shifts clockwise"
+        );
+        assert_eq!(
+            secondaries,
+            vec![9, 2, 3, 4, 5, 6, 7, 8],
+            "the second layer shifts counter-clockwise"
+        );
+    }
+
+    /// `rotate_layer` does nothing while its layer's rotation is off, or
+    /// while the layer is all black (the rotation is then stopped).
+    #[test]
+    fn rotate_layer_does_nothing_while_its_rotation_is_not_running() {
+        let mut bank = distinct_bank();
+        bank.rotate_layer(false);
+        assert_eq!(bank.colors(), distinct_bank().colors(), "off: no shift");
+
+        bank.toggle_rotation();
+        bank.toggle_all();
+        bank.toggle_off(); // every main color black
+        bank.rotate_layer(false);
+        assert_eq!(
+            bank.colors(),
+            vec![Color::BLACK; LED_COUNT],
+            "all black: no shift"
+        );
+    }
+
+    /// Eight shifts (one full turn) bring every color of the layer back to
+    /// where it started, in both directions.
     #[test]
     fn full_turn_restores_the_starting_colors() {
         for direction in [
@@ -862,7 +1087,7 @@ mod tests {
                 bank.flip_direction();
             }
             for _ in 0..LED_COUNT {
-                bank.rotate();
+                bank.rotate_layer(false);
             }
             assert_eq!(
                 bank.colors(),
@@ -922,11 +1147,17 @@ mod tests {
         let mut bank = red_bank();
         assert!(!bank.rainbow_on(), "the rainbow is not applied at first");
 
-        assert!(bank.toggle_rainbow(), "the first toggle applies the rainbow");
+        assert!(
+            bank.toggle_rainbow(),
+            "the first toggle applies the rainbow"
+        );
         assert_eq!(bank.colors(), LedBank::rainbow().colors());
         assert!(bank.rainbow_on());
 
-        assert!(!bank.toggle_rainbow(), "the second toggle removes the rainbow");
+        assert!(
+            !bank.toggle_rainbow(),
+            "the second toggle removes the rainbow"
+        );
         assert_eq!(
             bank.colors(),
             red_bank().colors(),
@@ -934,7 +1165,10 @@ mod tests {
         );
         assert!(!bank.rainbow_on());
 
-        assert!(bank.toggle_rainbow(), "the third toggle applies the rainbow again");
+        assert!(
+            bank.toggle_rainbow(),
+            "the third toggle applies the rainbow again"
+        );
         assert_eq!(bank.colors(), LedBank::rainbow().colors());
     }
 
@@ -966,17 +1200,27 @@ mod tests {
         bank.toggle_all();
         bank.set_color(Color::WHITE); // every second color is white
 
-        assert!(bank.toggle_rainbow(), "the first toggle applies the rainbow");
+        assert!(
+            bank.toggle_rainbow(),
+            "the first toggle applies the rainbow"
+        );
         let secondaries: Vec<Color> = bank.leds.iter().map(|led| led.secondary()).collect();
         assert_eq!(
             secondaries,
             LedBank::rainbow().colors(),
             "every second color takes its rainbow hue"
         );
-        assert_eq!(bank.colors(), red_bank().colors(), "the main colors are untouched");
+        assert_eq!(
+            bank.colors(),
+            red_bank().colors(),
+            "the main colors are untouched"
+        );
         assert!(bank.rainbow_on());
 
-        assert!(!bank.toggle_rainbow(), "the second toggle removes the rainbow");
+        assert!(
+            !bank.toggle_rainbow(),
+            "the second toggle removes the rainbow"
+        );
         let secondaries: Vec<Color> = bank.leds.iter().map(|led| led.secondary()).collect();
         assert_eq!(
             secondaries,
@@ -994,7 +1238,10 @@ mod tests {
         bank.toggle_all();
         bank.set_color(Color::WHITE); // every second color is white
 
-        assert!(bank.toggle_rainbow(), "the rainbow replaces the second colors");
+        assert!(
+            bank.toggle_rainbow(),
+            "the rainbow replaces the second colors"
+        );
         bank.toggle_editing(); // switch back to editing the main colors
 
         assert!(!bank.toggle_rainbow(), "toggling off ...");
@@ -1004,7 +1251,11 @@ mod tests {
             vec![Color::WHITE; LED_COUNT],
             "... restores the second colors (the slot the rainbow replaced)"
         );
-        assert_eq!(bank.colors(), red_bank().colors(), "the main colors are untouched");
+        assert_eq!(
+            bank.colors(),
+            red_bank().colors(),
+            "the main colors are untouched"
+        );
     }
 
     /// The rainbow spreads one hue per LED around the wheel: LED 1 starts at
@@ -1061,7 +1312,10 @@ mod tests {
 
         let mut one_lit = [Color::BLACK; LED_COUNT];
         one_lit[3] = Color::new(1, 0, 0);
-        assert!(LedBank::from_colors(one_lit).any_lit(), "one lit main color is on");
+        assert!(
+            LedBank::from_colors(one_lit).any_lit(),
+            "one lit main color is on"
+        );
 
         let mut second_only = LedBank::from_colors([Color::BLACK; LED_COUNT]);
         second_only.leds[5].set_secondary(Color::new(0, 1, 0));
@@ -1074,21 +1328,46 @@ mod tests {
     #[test]
     fn toggle_editing_switches_the_color_the_keys_target() {
         let mut bank = red_bank();
-        assert!(!bank.editing_secondary(), "the keys target the main color by default");
+        assert!(
+            !bank.editing_secondary(),
+            "the keys target the main color by default"
+        );
 
         bank.select(2);
-        assert!(bank.toggle_editing(), "the first toggle turns on second-color editing");
+        assert!(
+            bank.toggle_editing(),
+            "the first toggle turns on second-color editing"
+        );
 
         bank.set_color(Color::new(0, 0, 255));
-        assert_eq!(bank.colors()[1], Color::new(255, 0, 0), "the main color is untouched");
-        assert_eq!(bank.leds[1].secondary(), Color::new(0, 0, 255), "the second color is set");
+        assert_eq!(
+            bank.colors()[1],
+            Color::new(255, 0, 0),
+            "the main color is untouched"
+        );
+        assert_eq!(
+            bank.leds[1].secondary(),
+            Color::new(0, 0, 255),
+            "the second color is set"
+        );
 
         bank.adjust(Channel::Green, 16);
-        assert_eq!(bank.leds[1].secondary(), Color::new(0, 16, 255), "adjust hits the second color");
+        assert_eq!(
+            bank.leds[1].secondary(),
+            Color::new(0, 16, 255),
+            "adjust hits the second color"
+        );
 
-        assert!(!bank.toggle_editing(), "the next toggle returns to the main color");
+        assert!(
+            !bank.toggle_editing(),
+            "the next toggle returns to the main color"
+        );
         bank.set_color(Color::WHITE);
-        assert_eq!(bank.colors()[1], Color::WHITE, "the main color is set again");
+        assert_eq!(
+            bank.colors()[1],
+            Color::WHITE,
+            "the main color is set again"
+        );
     }
 
     /// `selected_active_color` yields the selected LED's color in the active
@@ -1100,9 +1379,17 @@ mod tests {
         bank.toggle_editing();
         bank.set_color(Color::new(0, 0, 255));
 
-        assert_eq!(bank.selected_active_color(), Color::new(0, 0, 255), "the active (second) color");
+        assert_eq!(
+            bank.selected_active_color(),
+            Color::new(0, 0, 255),
+            "the active (second) color"
+        );
         bank.toggle_editing();
-        assert_eq!(bank.selected_active_color(), Color::new(255, 0, 0), "back to the main color");
+        assert_eq!(
+            bank.selected_active_color(),
+            Color::new(255, 0, 0),
+            "back to the main color"
+        );
     }
 
     /// `active_colors` yields every LED's color in the active slot: the colors
@@ -1116,8 +1403,16 @@ mod tests {
         bank.set_color(Color::new(0, 0, 255)); // LED 2's second color is blue
 
         let active = bank.active_colors();
-        assert_eq!(active[1], Color::new(0, 0, 255), "the active (second) color");
-        assert_eq!(active[0], Color::BLACK, "LED 1's second color is off by default");
+        assert_eq!(
+            active[1],
+            Color::new(0, 0, 255),
+            "the active (second) color"
+        );
+        assert_eq!(
+            active[0],
+            Color::BLACK,
+            "LED 1's second color is off by default"
+        );
 
         bank.toggle_editing();
         assert_eq!(
@@ -1139,18 +1434,38 @@ mod tests {
         bank.toggle_editing();
 
         assert!(!bank.blink_on(), "the blink is off by default");
-        assert_eq!(bank.colors()[1], Color::new(255, 0, 0), "off: the main color shows");
+        assert_eq!(
+            bank.colors()[1],
+            Color::new(255, 0, 0),
+            "off: the main color shows"
+        );
 
         assert!(bank.toggle_blink(), "the first toggle turns the blink on");
-        assert_eq!(bank.colors()[1], Color::new(255, 0, 0), "on: it starts on the main color");
+        assert_eq!(
+            bank.colors()[1],
+            Color::new(255, 0, 0),
+            "on: it starts on the main color"
+        );
 
         bank.blink_step();
-        assert_eq!(bank.colors()[1], Color::new(0, 0, 255), "a step shows the second color");
+        assert_eq!(
+            bank.colors()[1],
+            Color::new(0, 0, 255),
+            "a step shows the second color"
+        );
         bank.blink_step();
-        assert_eq!(bank.colors()[1], Color::new(255, 0, 0), "and the next step returns to the main color");
+        assert_eq!(
+            bank.colors()[1],
+            Color::new(255, 0, 0),
+            "and the next step returns to the main color"
+        );
 
         assert!(!bank.toggle_blink(), "the next toggle turns the blink off");
-        assert_eq!(bank.colors()[1], Color::new(255, 0, 0), "off: the main color shows again");
+        assert_eq!(
+            bank.colors()[1],
+            Color::new(255, 0, 0),
+            "off: the main color shows again"
+        );
     }
 
     /// `primary_colors` always yields the main colors, even while the blink is
@@ -1182,6 +1497,10 @@ mod tests {
         assert_eq!(bank.blink_speed().hertz(), 2.0, "] steps up by 1 hz");
         bank.decrease_blink_speed();
         bank.decrease_blink_speed();
-        assert_eq!(bank.blink_speed().hertz(), 0.9, "[ steps down to the fine range");
+        assert_eq!(
+            bank.blink_speed().hertz(),
+            0.9,
+            "[ steps down to the fine range"
+        );
     }
 }

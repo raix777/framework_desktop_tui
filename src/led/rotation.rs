@@ -169,7 +169,11 @@ mod tests {
     fn rotation_speed_starts_at_the_default() {
         let speed = RotationSpeed::new();
         assert_eq!(speed.hertz(), 1.0, "one rotation per second");
-        assert_eq!(speed.interval(), Duration::from_millis(125), "a shift every 1/8 s");
+        assert_eq!(
+            speed.interval(),
+            Duration::from_millis(125),
+            "a shift every 1/8 s"
+        );
     }
 
     /// `interval` is one second per rotation, divided over the 8 shifts it
@@ -241,11 +245,108 @@ mod tests {
         }
         assert_eq!(
             seen,
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+            vec![
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100
+            ]
         );
         for _ in 0..seen.len() - 1 {
             speed.decrease();
         }
         assert_eq!(speed.tenths, 1, "back to the slowest");
+    }
+}
+
+/// The rotation state of one color layer: whether its colors travel around
+/// the ring, which way, and how fast.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LayerRotation {
+    on: bool,
+    direction: RotationDirection,
+    speed: RotationSpeed,
+}
+
+impl LayerRotation {
+    /// The default state: off, clockwise, at the default speed.
+    pub fn new() -> Self {
+        Self {
+            on: false,
+            direction: RotationDirection::Clockwise,
+            speed: RotationSpeed::new(),
+        }
+    }
+
+    /// Whether the layer's rotation is on.
+    pub fn on(&self) -> bool {
+        self.on
+    }
+
+    /// Toggle the layer's rotation. Returns the new state.
+    pub fn toggle(&mut self) -> bool {
+        self.on = !self.on;
+        self.on
+    }
+
+    /// The direction the layer's colors travel while rotating.
+    pub fn direction(&self) -> RotationDirection {
+        self.direction
+    }
+
+    /// Flip the layer's direction.
+    pub fn flip_direction(&mut self) {
+        self.direction = self.direction.flipped();
+    }
+
+    /// The layer's rotation speed (full rotations per second).
+    pub fn speed(&self) -> RotationSpeed {
+        self.speed
+    }
+
+    /// Increase the layer's rotation speed by one step.
+    pub fn increase_speed(&mut self) {
+        self.speed.increase();
+    }
+
+    /// Decrease the layer's rotation speed by one step.
+    pub fn decrease_speed(&mut self) {
+        self.speed.decrease();
+    }
+}
+
+#[cfg(test)]
+mod layer_rotation_tests {
+    use super::*;
+
+    /// A layer rotation starts off, clockwise, at the default speed.
+    #[test]
+    fn layer_rotation_starts_off_and_clockwise() {
+        let rotation = LayerRotation::new();
+        assert!(!rotation.on(), "off by default");
+        assert_eq!(
+            rotation.direction(),
+            RotationDirection::Clockwise,
+            "clockwise by default"
+        );
+        assert_eq!(rotation.speed().hertz(), 1.0, "the default speed");
+    }
+
+    /// `toggle` flips the layer rotation, which starts off.
+    #[test]
+    fn toggle_flips_the_layer_rotation() {
+        let mut rotation = LayerRotation::new();
+        assert!(rotation.toggle(), "the first toggle turns it on");
+        assert!(!rotation.toggle(), "the second toggle turns it off");
+    }
+
+    /// A layer rotation keeps its own direction and speed.
+    #[test]
+    fn a_layer_rotation_keeps_its_own_direction_and_speed() {
+        let mut rotation = LayerRotation::new();
+        rotation.flip_direction();
+        assert_eq!(rotation.direction(), RotationDirection::CounterClockwise);
+        rotation.increase_speed();
+        assert_eq!(rotation.speed().hertz(), 2.0);
+        rotation.decrease_speed();
+        rotation.decrease_speed();
+        assert_eq!(rotation.speed().hertz(), 0.9);
     }
 }

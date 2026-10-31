@@ -13,10 +13,12 @@ number sits in its LED's wedge, drawn in the inverse of the wedge's color
 (e.g. a red wedge gets a cyan number) so it stays readable on any color.
 Select a LED with the `1` to `8` keys and adjust its color independently —
 each LED keeps its own color, written straight to the embedded controller (EC).
-Toggle `t` and the colors travel around the ring instead: the color of LED 1
-moves to position 8, the color of 8 to position 7, and so on (one full turn
-per second by default); `s` flips the direction between clockwise and
-counter-clockwise, and `+`/`-` set the rotation speed (0.1 to 10 hz).
+Toggle `t` and the colors of the layer the color keys are editing travel
+around the ring instead: the color of LED 1 moves to position 8, the color of
+8 to position 7, and so on (one full turn per second by default), while the
+other layer's colors stay put; `s` flips the direction between clockwise and
+counter-clockwise, and `+`/`-` set the rotation speed (0.1 to 10 hz) — each
+acting on the layer being edited, so the two layers rotate independently.
 
 Each LED can hold a second color. `m` switches the color keys between the
 main and the second color, `p` toggles the two-color blink, and while it is
@@ -71,13 +73,15 @@ sudo ./target/release/framework_desktop_tui
 |            | change per second by default)                      |
 | `[`/`]`    | decrease / increase the blink rate (color changes  |
 |            | per second, 0.1 to 10 hz)                          |
-| `t`        | toggle the rotation: while on, the colors shift one|
-|            | position around the ring at the rotation speed (one|
-|            | full turn per second by default)                   |
-| `s`        | flip the rotation direction (clockwise /           |
-|            | counter-clockwise)                                 |
-| `+`/`-`    | increase / decrease the rotation speed (full       |
-|            | rotations per second, 0.1 to 10 hz)               |
+| `t`        | toggle the rotation of the layer the color keys    |
+|            | are editing: its colors shift one position around  |
+|            | the ring at the rotation speed (one full turn per  |
+|            | second by default), the other layer stays put      |
+| `s`        | flip the rotation direction of the layer the color |
+|            | keys are editing (clockwise / counter-clockwise)   |
+| `+`/`-`    | increase / decrease the rotation speed of the layer|
+|            | the color keys are editing (full rotations per     |
+|            | second, 0.1 to 10 hz)                              |
 | `Up`/`Down`| increase / decrease the fan speed by 3%; while the |
 |            | automatic control is on the value is stored and    |
 |            | applied when it is switched off                    |
