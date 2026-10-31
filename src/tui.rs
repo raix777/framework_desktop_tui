@@ -22,11 +22,12 @@
 //! - `g` / `G` — raise / lower green by 1
 //! - `b` / `B` — raise / lower blue by 1
 //! - `c` — toggle the target LED (or every LED in all-mode) between off
-//!   (black) and the color it had before
+//!   (black) and the color it had before, in whichever color the color keys
+//!   are editing
 //! - `w` — toggle the rainbow preset: on, every LED takes one hue of the
-//!   color wheel (LED 1 red, stepping around the ring, regardless of the
-//!   selected LED or all-mode); off, the colors from before the rainbow are
-//!   restored
+//!   color wheel in whichever color the color keys are editing (LED 1 red,
+//!   stepping around the ring, regardless of the selected LED or all-mode);
+//!   off, the colors from before the rainbow are restored
 //! - `m` — toggle which of the LED's two colors the color keys are editing:
 //!   the main color or the second one (off by default, editing the main color)
 //! - `n` — toggle the two-color blink: while on, every LED changes between its
@@ -38,8 +39,8 @@
 //!   block's color; selecting a LED re-points the pointer at the nearest block
 //! - `t` — toggle the rotation: while on, the colors shift one position
 //!   around the ring at the current rotation speed (LED 1's color moves to
-//!   LED 8, and so on). While every LED is off the rotation is stopped
-//!   (nothing to rotate), and `s` and `+`/`-` do nothing; when a LED is lit
+//!   LED 8, and so on). While no color is lit the rotation is stopped
+//!   (nothing to rotate), and `s` and `+`/`-` do nothing; when a color is lit
 //!   again, the rotation picks up where it left off
 //! - `s` — flip the rotation direction (clockwise ↔ counter-clockwise)
 //! - `+`/`-` — increase / decrease the rotation speed (full rotations per
@@ -418,10 +419,11 @@ impl App {
             }
             KeyCode::Char('x') => return self.toggle_auto(fan),
             // Toggle the target LED (or every LED in all-mode) between off
-            // (black) and its previous color.
+            // (black) and its previous color, in whichever color the color
+            // keys are editing.
             KeyCode::Char('c') => self.leds.toggle_off(),
-            // The rainbow preset: toggle it on (remembering the current
-            // colors) or off (restoring the remembered colors).
+            // The rainbow preset: toggle it on (remembering the colors of the
+            // active slot) or off (restoring the remembered colors).
             KeyCode::Char('w') => {
                 self.leds.toggle_rainbow();
                 self.sync_color_bar();
@@ -558,10 +560,10 @@ pub fn run<F: FanController>(fan: &F) -> Result<(), Box<dyn std::error::Error>> 
 /// While the color ring is rotating, the loop also shifts the colors one
 /// position at the rotation's current interval (which depends on its speed)
 /// and writes the fan, so the colors travel around the ring at that speed.
-/// The rotation is stopped while every LED is off, so while the fan is
-/// all-black nothing shifts and nothing is written. While the two-color blink
-/// is on, the loop also flips each LED between its two colors at the blink's
-/// current interval and writes the fan.
+/// The rotation is stopped while no color is lit (nothing to rotate), so
+/// while the fan is all-black nothing shifts and nothing is written. While
+/// the two-color blink is on, the loop also flips each LED between its two
+/// colors at the blink's current interval and writes the fan.
 fn run_loop<F: FanController>(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     fan: &F,
@@ -595,9 +597,9 @@ fn run_loop<F: FanController>(
         let interval = app.leds.rotation_speed().interval();
         let blink_interval = app.leds.blink_speed().interval();
 
-        // Shift the colors once the ring's deadline has come. While every
-        // LED is off the rotation is stopped, so nothing shifts (or writes
-        // the fan) until a LED is lit again.
+        // Shift the colors once the ring's deadline has come. While no color
+        // is lit the rotation is stopped, so nothing shifts (or writes the
+        // fan) until a color is lit again.
         let now = Instant::now();
         if let Some(deadline) = next_shift
             && app.leds.rotating()
@@ -1623,6 +1625,33 @@ mod tests {
         );
     }
 
+    /// While rotating, a shift moves the second colors around the ring too,
+    /// so the shift is visible while they are being edited.
+    #[test]
+    fn rotating_tui_shifts_the_second_colors_too() {
+        let fan = CountingFan::default();
+        let mut leds = LedBank::from_colors([Color::BLACK; LED_COUNT]);
+        for number in 1..=LED_COUNT as u8 {
+            leds.select(number);
+            leds.toggle_editing();
+            leds.set_color(Color::new(number, 0, 0)); // a distinct second color per LED
+            leds.toggle_editing();
+        }
+        let mut app = App::new(leds);
+
+        app.leds.toggle_rotation();
+        app.leds.rotate(); // one tick, as the event loop performs it
+        app.apply(&fan);
+
+        let secondaries: Vec<u8> = app.leds.indexed().map(|(_, led)| led.secondary().r).collect();
+        assert_eq!(
+            secondaries,
+            vec![2, 3, 4, 5, 6, 7, 8, 1],
+            "LED 1's second color lands on LED 8, like the main colors"
+        );
+        assert_eq!(fan.writes.get(), 1, "the rotation tick writes the fan");
+    }
+
     /// `m` toggles which color the color keys edit: while it edits the second
     /// color, a key changes the second one (the main color is untouched), the
     /// color bar's pointer follows the active color, and `m` itself writes no
@@ -2508,6 +2537,59 @@ mod tests {
             assert_eq!(color, Color::BLACK, "every LED should be black");
         }
         assert_eq!(fan.writes.get(), 1, "the new color is written to the fan");
+    }
+
+    /// While the color keys edit the second color, `w` applies the rainbow to
+    /// the second colors (the main colors are untouched) and writes the fan.
+    #[test]
+    fn w_applies_the_rainbow_to_the_second_color_while_editing_it() {
+        let fan = CountingFan::default();
+        let mut app = App::new(red_bank());
+        app.leds.toggle_editing();
+        app.leds.toggle_all();
+        app.leds.set_color(Color::WHITE); // every second color is white
+
+        assert!(
+            app.handle_key(key(KeyCode::Char('w')), &fan),
+            "w keeps the app running"
+        );
+        let secondaries: Vec<Color> = app.leds.indexed().map(|(_, led)| led.secondary()).collect();
+        assert_eq!(
+            secondaries,
+            LedBank::rainbow().colors(),
+            "every second color takes its rainbow hue"
+        );
+        assert_eq!(
+            app.leds.colors(),
+            red_bank().colors(),
+            "the main colors are untouched"
+        );
+        assert_eq!(fan.writes.get(), 1, "the press writes the fan");
+    }
+
+    /// While the color keys edit the second color, `c` blacks out the second
+    /// color (not the main one) and writes the fan.
+    #[test]
+    fn c_blacks_out_the_second_color_while_editing_it() {
+        let fan = CountingFan::default();
+        let mut app = App::new(red_bank());
+        app.leds.toggle_editing();
+        app.leds.toggle_all();
+        app.leds.set_color(Color::WHITE); // every second color is white
+
+        assert!(
+            app.handle_key(key(KeyCode::Char('c')), &fan),
+            "c keeps the app running"
+        );
+        for (_, led) in app.leds.indexed() {
+            assert_eq!(led.secondary(), Color::BLACK, "the second color is blacked out");
+            assert_eq!(
+                led.color(),
+                Color::new(255, 0, 0),
+                "the main color is untouched"
+            );
+        }
+        assert_eq!(fan.writes.get(), 1, "the press writes the fan");
     }
 
     /// Pressing `c` twice in a row blacks out the selected LED and then

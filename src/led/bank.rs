@@ -11,9 +11,10 @@ use crate::fan::{Color, LED_COUNT};
 /// whole set in order for `FanController::write`.
 ///
 /// Each LED has two colors: the main color and a second one it blinks to. The
-/// color keys edit whichever color is active (the main one by default); the
-/// two-color blink, while on, makes every LED change between its two colors at
-/// the blink rate.
+/// color keys, `c`, and the rainbow preset act on whichever color is active
+/// (the main one by default); the rotation moves both colors of a LED around
+/// the ring together. The two-color blink, while on, makes every LED change
+/// between its two colors at the blink rate.
 #[derive(Debug)]
 pub struct LedBank {
     leds: [Led; LED_COUNT],
@@ -33,10 +34,11 @@ pub struct LedBank {
     rotation: bool,
     direction: RotationDirection,
     rotation_speed: RotationSpeed,
-    /// The colors in effect before the rainbow preset was last applied, so
-    /// that toggling the rainbow off restores them. `None` while the rainbow
-    /// is not applied.
-    rainbow_previous: Option<[Color; LED_COUNT]>,
+    /// The colors in effect in the slot the rainbow preset replaced, and
+    /// which slot that was (`true` for the second color), so that toggling
+    /// the rainbow off restores them to the slot they came from. `None` while
+    /// the rainbow is not applied.
+    rainbow_previous: Option<([Color; LED_COUNT], bool)>,
 }
 
 /// The rainbow colors in ring order: LED `i` shows hue `i · 360/LED_COUNT`,
@@ -179,23 +181,42 @@ impl LedBank {
         });
     }
 
-    /// Toggle the target LED(s) between off (black) and the color they had
-    /// before.
+    /// Toggle the active color of the target LED(s) between off (black) and
+    /// the color it had before.
     pub fn toggle_off(&mut self) {
-        self.update_targets(|led| led.toggle_off());
+        let editing_secondary = self.editing_secondary;
+        self.update_targets(|led| {
+            if editing_secondary {
+                led.toggle_off_secondary();
+            } else {
+                led.toggle_off();
+            }
+        });
     }
 
-    /// Apply the rainbow preset: every LED takes its rainbow hue (the whole
-    /// ring, regardless of the selected LED or all-mode).
+    /// Apply the rainbow preset: every LED takes its rainbow hue in whichever
+    /// color the color keys are editing (the whole ring, regardless of the
+    /// selected LED or all-mode).
     pub fn apply_rainbow(&mut self) {
-        self.set_all(rainbow_colors());
+        self.set_slot_colors(self.editing_secondary, rainbow_colors());
     }
 
-    /// Set every LED to the given colors (in ring order).
-    fn set_all(&mut self, colors: [Color; LED_COUNT]) {
+    /// Set the color in the given slot (the second color when `secondary`,
+    /// the main one otherwise) of every LED (in ring order).
+    fn set_slot_colors(&mut self, secondary: bool, colors: [Color; LED_COUNT]) {
         for (led, color) in self.leds.iter_mut().zip(colors) {
-            led.set_color(color);
+            if secondary {
+                led.set_secondary(color);
+            } else {
+                led.set_color(color);
+            }
         }
+    }
+
+    /// The color in the given slot (the second color when `secondary`, the
+    /// main one otherwise) of every LED, in ring order.
+    fn slot_colors(&self, secondary: bool) -> [Color; LED_COUNT] {
+        self.leds.map(|led| if secondary { led.secondary() } else { led.color() })
     }
 
     /// Whether the rainbow preset is currently applied.
@@ -204,15 +225,16 @@ impl LedBank {
     }
 
     /// Toggle the rainbow preset: while it is not applied, the current colors
-    /// are remembered and the rainbow is applied; while it is applied, the
-    /// remembered colors are restored. Returns the new state.
+    /// of the active slot are remembered and the rainbow is applied to that
+    /// slot; while it is applied, the remembered colors are restored to the
+    /// slot they came from. Returns the new state.
     pub fn toggle_rainbow(&mut self) -> bool {
         match self.rainbow_previous.take() {
-            Some(previous) => self.set_all(previous),
+            Some((previous, secondary)) => self.set_slot_colors(secondary, previous),
             None => {
-                let current: [Color; LED_COUNT] = self.leds.map(|led| led.color());
+                let current = self.slot_colors(self.editing_secondary);
                 self.apply_rainbow();
-                self.rainbow_previous = Some(current);
+                self.rainbow_previous = Some((current, self.editing_secondary));
             }
         }
         self.rainbow_on()
@@ -244,8 +266,9 @@ impl LedBank {
     }
 
     /// Whether the rotation is running: the toggle is on and at least one
-    /// LED is lit. While every LED is off the rotation is stopped (there is
-    /// nothing to rotate), and its direction and speed controls do nothing.
+    /// color (main or second) is lit. While no color is lit the rotation is
+    /// stopped (there is nothing to rotate), and its direction and speed
+    /// controls do nothing.
     pub fn rotating(&self) -> bool {
         self.rotation && self.any_lit()
     }
@@ -255,8 +278,8 @@ impl LedBank {
         self.direction
     }
 
-    /// Flip the rotation direction. Does nothing while every LED is off
-    /// (the rotation is then stopped).
+    /// Flip the rotation direction. Does nothing while no color is lit (the
+    /// rotation is then stopped).
     pub fn flip_direction(&mut self) {
         if self.any_lit() {
             self.direction = self.direction.flipped();
@@ -269,7 +292,7 @@ impl LedBank {
     }
 
     /// Increase the rotation speed by one step (0.1 hz below 1 hz, 1 hz
-    /// above). Does nothing while every LED is off (the rotation is then
+    /// above). Does nothing while no color is lit (the rotation is then
     /// stopped).
     pub fn increase_rotation_speed(&mut self) {
         if self.any_lit() {
@@ -278,7 +301,7 @@ impl LedBank {
     }
 
     /// Decrease the rotation speed by one step (1 hz above 1 hz, 0.1 hz
-    /// below). Does nothing while every LED is off (the rotation is then
+    /// below). Does nothing while no color is lit (the rotation is then
     /// stopped).
     pub fn decrease_rotation_speed(&mut self) {
         if self.any_lit() {
@@ -286,12 +309,16 @@ impl LedBank {
         }
     }
 
-    /// Shift every LED's color one position around the ring, in the current
-    /// direction.
+    /// Shift both colors of every LED one position around the ring, in the
+    /// current direction, so each LED keeps its main and second colors
+    /// together.
     pub fn rotate(&mut self) {
-        let previous: [Color; LED_COUNT] = self.leds.map(|led| led.color());
+        let previous: [(Color, Color); LED_COUNT] =
+            self.leds.map(|led| (led.color(), led.secondary()));
         for (position, led) in self.leds.iter_mut().enumerate() {
-            led.set_color(previous[self.direction.source_position(position)]);
+            let (color, secondary) = previous[self.direction.source_position(position)];
+            led.set_color(color);
+            led.set_secondary(secondary);
         }
     }
 }
@@ -333,9 +360,12 @@ impl LedBank {
 }
 
 impl LedBank {
-    /// Whether at least one LED is lit (i.e. not black).
+    /// Whether any of the LEDs' colors (main or second) is lit (i.e. not
+    /// black).
     pub fn any_lit(&self) -> bool {
-        self.leds.iter().any(|led| led.color() != Color::BLACK)
+        self.leds
+            .iter()
+            .any(|led| led.color() != Color::BLACK || led.secondary() != Color::BLACK)
     }
 
     /// Iterate the LEDs as `(0-based index, &Led)` in ring order.
@@ -562,6 +592,41 @@ mod tests {
         }
     }
 
+    /// `toggle_off` targets the color the color keys are editing: while the
+    /// second color is edited, it blacks out (and later restores) the second
+    /// color, leaving the main color alone.
+    #[test]
+    fn toggle_off_targets_the_second_color_while_editing_it() {
+        let mut bank = red_bank();
+        bank.select(2);
+        bank.toggle_editing();
+        bank.set_color(Color::new(0, 0, 255)); // LED 2's second color is blue
+
+        bank.toggle_off();
+        assert_eq!(bank.leds[1].secondary(), Color::BLACK, "the second color is blacked out");
+        assert_eq!(
+            bank.leds[1].color(),
+            Color::new(255, 0, 0),
+            "the main color is untouched"
+        );
+        for (index, led) in bank.leds.iter().enumerate() {
+            if index != 1 {
+                assert_eq!(
+                    led.secondary(),
+                    Color::BLACK,
+                    "LED {index}'s second color is untouched"
+                );
+            }
+        }
+
+        bank.toggle_off();
+        assert_eq!(
+            bank.leds[1].secondary(),
+            Color::new(0, 0, 255),
+            "the second toggle restores the second color"
+        );
+    }
+
     /// `toggle_all` flips all-mode, which starts off.
     #[test]
     fn toggle_all_flips_the_mode() {
@@ -643,6 +708,31 @@ mod tests {
 
         bank.toggle_off(); // every LED back to its color
         assert!(bank.rotating(), "lit again: running again");
+    }
+
+    /// The rotation runs while only the second colors are lit (every main
+    /// color black), and its direction and speed controls work too.
+    #[test]
+    fn rotation_runs_while_only_the_second_colors_are_lit() {
+        let mut bank = LedBank::from_colors([Color::BLACK; LED_COUNT]);
+        bank.toggle_editing();
+        bank.toggle_all();
+        bank.set_color(Color::new(255, 0, 0)); // every second color is red
+        bank.toggle_editing();
+
+        assert!(bank.any_lit(), "a lit second color counts as lit");
+
+        bank.toggle_rotation();
+        assert!(bank.rotating(), "the rotation runs on the second colors alone");
+
+        bank.flip_direction();
+        assert_eq!(
+            bank.rotation_direction(),
+            RotationDirection::CounterClockwise,
+            "the direction control works"
+        );
+        bank.increase_rotation_speed();
+        assert_eq!(bank.rotation_speed().hertz(), 2.0, "the speed control works");
     }
 
     /// The rotation toggle still works while every LED is off: it turns the
@@ -731,6 +821,31 @@ mod tests {
             vec![8, 1, 2, 3, 4, 5, 6, 7],
             "each slot should hold the color of the LED one number down \
              (LED 8's color wraps around to LED 1)"
+        );
+    }
+
+    /// `rotate` moves both colors of every LED one position around the ring,
+    /// so each LED keeps its main and second colors together.
+    #[test]
+    fn rotate_moves_both_colors_of_every_led_together() {
+        let mut bank = distinct_bank();
+        for (index, led) in bank.leds.iter_mut().enumerate() {
+            led.set_secondary(Color::new((index + 2) as u8, 0, 0));
+        }
+
+        bank.rotate();
+
+        let primaries: Vec<u8> = bank.colors().iter().map(|color| color.r).collect();
+        let secondaries: Vec<u8> = bank.leds.iter().map(|led| led.secondary().r).collect();
+        assert_eq!(
+            primaries,
+            vec![2, 3, 4, 5, 6, 7, 8, 1],
+            "the main colors shift clockwise"
+        );
+        assert_eq!(
+            secondaries,
+            vec![3, 4, 5, 6, 7, 8, 9, 2],
+            "the second colors shift with them"
         );
     }
 
@@ -841,6 +956,57 @@ mod tests {
         );
     }
 
+    /// While the second color is being edited, `toggle_rainbow` applies the
+    /// rainbow to the second colors (the main colors are untouched) and
+    /// restores the previous second colors when toggled off again.
+    #[test]
+    fn toggle_rainbow_applies_to_the_second_color_while_editing_it() {
+        let mut bank = red_bank();
+        bank.toggle_editing();
+        bank.toggle_all();
+        bank.set_color(Color::WHITE); // every second color is white
+
+        assert!(bank.toggle_rainbow(), "the first toggle applies the rainbow");
+        let secondaries: Vec<Color> = bank.leds.iter().map(|led| led.secondary()).collect();
+        assert_eq!(
+            secondaries,
+            LedBank::rainbow().colors(),
+            "every second color takes its rainbow hue"
+        );
+        assert_eq!(bank.colors(), red_bank().colors(), "the main colors are untouched");
+        assert!(bank.rainbow_on());
+
+        assert!(!bank.toggle_rainbow(), "the second toggle removes the rainbow");
+        let secondaries: Vec<Color> = bank.leds.iter().map(|led| led.secondary()).collect();
+        assert_eq!(
+            secondaries,
+            vec![Color::WHITE; LED_COUNT],
+            "the previous second colors are restored"
+        );
+    }
+
+    /// The rainbow restores the slot it replaced, even if the editing target
+    /// switches to the other color in the meantime.
+    #[test]
+    fn toggle_rainbow_restores_the_slot_it_replaced_even_after_switching() {
+        let mut bank = red_bank();
+        bank.toggle_editing();
+        bank.toggle_all();
+        bank.set_color(Color::WHITE); // every second color is white
+
+        assert!(bank.toggle_rainbow(), "the rainbow replaces the second colors");
+        bank.toggle_editing(); // switch back to editing the main colors
+
+        assert!(!bank.toggle_rainbow(), "toggling off ...");
+        let secondaries: Vec<Color> = bank.leds.iter().map(|led| led.secondary()).collect();
+        assert_eq!(
+            secondaries,
+            vec![Color::WHITE; LED_COUNT],
+            "... restores the second colors (the slot the rainbow replaced)"
+        );
+        assert_eq!(bank.colors(), red_bank().colors(), "the main colors are untouched");
+    }
+
     /// The rainbow spreads one hue per LED around the wheel: LED 1 starts at
     /// red, no two LEDs share a color, and every LED is lit.
     #[test]
@@ -887,7 +1053,7 @@ mod tests {
         assert!(!bank.all_mode());
     }
 
-    /// `any_lit` is false only when every LED is black.
+    /// `any_lit` is false only when every color (main and second) is black.
     #[test]
     fn any_lit_is_false_only_when_all_black() {
         let all_off = LedBank::from_colors([Color::BLACK; LED_COUNT]);
@@ -895,7 +1061,11 @@ mod tests {
 
         let mut one_lit = [Color::BLACK; LED_COUNT];
         one_lit[3] = Color::new(1, 0, 0);
-        assert!(LedBank::from_colors(one_lit).any_lit(), "one lit LED is on");
+        assert!(LedBank::from_colors(one_lit).any_lit(), "one lit main color is on");
+
+        let mut second_only = LedBank::from_colors([Color::BLACK; LED_COUNT]);
+        second_only.leds[5].set_secondary(Color::new(0, 1, 0));
+        assert!(second_only.any_lit(), "one lit second color is on");
     }
 
     /// `toggle_editing` flips which color the color keys target (the main
