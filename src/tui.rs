@@ -23,6 +23,16 @@
 //! - `b` / `B` — raise / lower blue by 1
 //! - `c` — toggle the target LED (or every LED in all-mode) between off
 //!   (black) and the color it had before
+//! - `w` — toggle the rainbow preset: on, every LED takes one hue of the
+//!   color wheel (LED 1 red, stepping around the ring, regardless of the
+//!   selected LED or all-mode); off, the colors from before the rainbow are
+//!   restored
+//! - `m` — toggle which of the LED's two colors the color keys are editing:
+//!   the main color or the second one (off by default, editing the main color)
+//! - `n` — toggle the two-color blink: while on, every LED changes between its
+//!   two colors at the blink rate (one change every 1 s by default)
+//! - `o`/`p` — decrease / increase the blink rate (color changes per second,
+//!   0.1 to 10 hz: steps of 0.1 hz below 1 hz, 1 hz above)
 //! - `Left` / `Right` — move the color bar's pointer one block left / right (it
 //!   wraps around at the ends) and set the target LED (or all LEDs) to that
 //!   block's color; selecting a LED re-points the pointer at the nearest block
@@ -77,7 +87,9 @@ use crate::fan::{
     Color, FanController, FanError, LED_COUNT, SPEED_STEP, SpeedControl, SpeedState,
     ThermalSnapshot,
 };
-use crate::led::{COLOR_STEP, Channel, LedBank, RotationDirection, RotationSpeed};
+use crate::led::{
+    BlinkSpeed, COLOR_STEP, Channel, LedBank, RotationDirection, RotationSpeed,
+};
 use crate::state;
 
 /// How long the event loop waits for input before redrawing.
@@ -277,10 +289,10 @@ impl App {
         app
     }
 
-    /// Point the color bar's pointer at the block nearest the currently
-    /// selected LED's color, so the pointer matches that LED's color.
+    /// Point the color bar's pointer at the block nearest the color the color
+    /// keys are editing on the selected LED, so the pointer matches it.
     fn sync_color_bar(&mut self) {
-        self.color_bar.set_nearest(self.leds.selected().color());
+        self.color_bar.set_nearest(self.leds.selected_active_color());
     }
 
     /// Set the target LED (or every LED in all-mode) to the color bar's pointed
@@ -296,11 +308,13 @@ impl App {
         self.remember_error(fan.write(&self.leds.colors()));
     }
 
-    /// Save the current colors so the next run restores them instead of
+    /// Save the LEDs' main colors so the next run restores them instead of
     /// assuming the fan is off. Best-effort: the EC cannot report the colors
     /// back, so without this the app could not tell a lit fan from an off one.
+    /// The second colors and the blink are session state (like the rotation),
+    /// so they are not saved.
     fn persist(&self) {
-        let _ = state::save(&self.leds.colors());
+        let _ = state::save(&self.leds.primary_colors());
     }
 
     /// Push the stored speed to the fan, remembering any error for display.
@@ -406,6 +420,37 @@ impl App {
             // Toggle the target LED (or every LED in all-mode) between off
             // (black) and its previous color.
             KeyCode::Char('c') => self.leds.toggle_off(),
+            // The rainbow preset: toggle it on (remembering the current
+            // colors) or off (restoring the remembered colors).
+            KeyCode::Char('w') => {
+                self.leds.toggle_rainbow();
+                self.sync_color_bar();
+            }
+            // Which of the LED's two colors the color keys edit: it does not
+            // change the fan right now, so no write is needed. The color bar's
+            // pointer follows the newly active color.
+            KeyCode::Char('m') => {
+                self.leds.toggle_editing();
+                self.sync_color_bar();
+                return true;
+            }
+            // The two-color blink: while it is on, the event loop changes the
+            // colors at the blink rate (that is what writes the fan); toggling
+            // it on starts on the main colors, so no write is needed yet.
+            KeyCode::Char('n') => {
+                self.leds.toggle_blink();
+                return true;
+            }
+            // The blink rate only changes how often the event loop will step
+            // the colors, so no write is needed.
+            KeyCode::Char('o') => {
+                self.leds.decrease_blink_speed();
+                return true;
+            }
+            KeyCode::Char('p') => {
+                self.leds.increase_blink_speed();
+                return true;
+            }
             // A color key changes one channel by 1; the color bar's pointer
             // then follows the new color to the nearest block. Any other key
             // leaves the fan alone.
@@ -514,7 +559,9 @@ pub fn run<F: FanController>(fan: &F) -> Result<(), Box<dyn std::error::Error>> 
 /// position at the rotation's current interval (which depends on its speed)
 /// and writes the fan, so the colors travel around the ring at that speed.
 /// The rotation is stopped while every LED is off, so while the fan is
-/// all-black nothing shifts and nothing is written.
+/// all-black nothing shifts and nothing is written. While the two-color blink
+/// is on, the loop also flips each LED between its two colors at the blink's
+/// current interval and writes the fan.
 fn run_loop<F: FanController>(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     fan: &F,
@@ -539,9 +586,14 @@ fn run_loop<F: FanController>(
     // does not drift with frame times. `None` while rotation is off.
     let mut next_shift: Option<Instant> = None;
 
+    // While the blink is on: the time of the next color change. `None` while
+    // the blink is off.
+    let mut next_blink: Option<Instant> = None;
+
     loop {
-        // The rotation's current interval (from its speed).
+        // The rotation's and the blink's current intervals (from their rates).
         let interval = app.leds.rotation_speed().interval();
+        let blink_interval = app.leds.blink_speed().interval();
 
         // Shift the colors once the ring's deadline has come. While every
         // LED is off the rotation is stopped, so nothing shifts (or writes
@@ -557,6 +609,18 @@ fn run_loop<F: FanController>(
             next_shift = Some(next_deadline(deadline, interval, now));
         }
 
+        // Change every LED's color once the blink's deadline has come. The
+        // main colors are unchanged by a step, so the state file is left
+        // alone.
+        if let Some(deadline) = next_blink
+            && app.leds.blink_on()
+            && now >= deadline
+        {
+            app.leds.blink_step();
+            app.apply(fan);
+            next_blink = Some(next_deadline(deadline, blink_interval, now));
+        }
+
         // Refresh the thermal data once its deadline has come.
         if now >= next_thermal {
             app.read_thermal(fan);
@@ -565,12 +629,14 @@ fn run_loop<F: FanController>(
 
         terminal.draw(|frame| draw(frame, &app))?;
 
-        // Wait for input or for the next deadline (rotation shift or thermal
-        // refresh), whichever comes first; if nothing is pending, just redraw
-        // on the next tick.
+        // Wait for input or for the next deadline (a rotation shift, a blink
+        // step, or the thermal refresh), whichever comes first; if nothing is
+        // pending, just redraw on the next tick.
         let wait = next_wait(
             next_shift,
             app.leds.rotating(),
+            next_blink,
+            app.leds.blink_on(),
             next_thermal,
             Instant::now(),
         );
@@ -582,16 +648,26 @@ fn run_loop<F: FanController>(
         {
             let was_rotating = app.leds.rotation_on();
             let was_speed: RotationSpeed = app.leds.rotation_speed();
+            let was_blinking = app.leds.blink_on();
+            let was_blink_speed: BlinkSpeed = app.leds.blink_speed();
             if !app.handle_key(key, fan) {
                 break;
             }
             let is_rotating = app.leds.rotation_on();
             let is_speed: RotationSpeed = app.leds.rotation_speed();
+            let is_blinking = app.leds.blink_on();
+            let is_blink_speed: BlinkSpeed = app.leds.blink_speed();
             // The rotation (re)started, stopped, or changed speed: the next
             // shift is one interval from now at the new speed (or ticking stops
             // altogether when the rotation is off).
             if was_rotating != is_rotating || was_speed != is_speed {
                 next_shift = is_rotating.then(|| Instant::now() + is_speed.interval());
+            }
+            // The blink (re)started, stopped, or changed rate: the next color
+            // change is one interval from now at the new rate (or ticking stops
+            // altogether when the blink is off).
+            if was_blinking != is_blinking || was_blink_speed != is_blink_speed {
+                next_blink = is_blinking.then(|| Instant::now() + is_blink_speed.interval());
             }
         }
     }
@@ -609,20 +685,24 @@ fn next_deadline(deadline: Instant, interval: Duration, now: Instant) -> Instant
     next
 }
 
-/// The time to wait for the next wake: the next rotation shift (while
-/// rotating), the next thermal refresh, or the poll timeout, whichever is
-/// soonest.
+/// The time to wait for the next wake: the soonest of the next rotation shift
+/// (while rotating) and the next blink step (while blinking); when neither is
+/// pending, the poll timeout. The thermal refresh is always considered.
 fn next_wait(
     next_shift: Option<Instant>,
     rotating: bool,
+    next_blink: Option<Instant>,
+    blinking: bool,
     next_thermal: Instant,
     now: Instant,
 ) -> Duration {
-    let base = match (next_shift, rotating) {
-        (Some(deadline), true) => deadline.saturating_duration_since(now),
-        _ => POLL_TIMEOUT,
-    };
-    base.min(next_thermal.saturating_duration_since(now))
+    let pending = [next_shift.filter(|_| rotating), next_blink.filter(|_| blinking)]
+        .into_iter()
+        .flatten()
+        .min()
+        .map(|deadline| deadline.saturating_duration_since(now))
+        .unwrap_or(POLL_TIMEOUT);
+    pending.min(next_thermal.saturating_duration_since(now))
 }
 
 /// Render one frame: title, fan (speed bar and ring), and footer.
@@ -824,7 +904,7 @@ fn draw_fan_ring(frame: &mut Frame, app: &App, area: Rect) {
 fn paint_fan(ctx: &mut Context, app: &App, width: u16, height: u16) {
     let selected_index = app.leds.selected_index();
     let all_mode = app.leds.all_mode();
-    let colors = app.leds.colors();
+    let colors = app.leds.active_colors();
 
     // The filled disc, drawn first so everything else paints on top.
     paint_disc(ctx, width, height, &colors);
@@ -850,12 +930,15 @@ fn paint_fan(ctx: &mut Context, app: &App, width: u16, height: u16) {
         });
     }
 
-    // One point per LED, each in its own color.
-    for (index, led) in app.leds.indexed() {
+    // One point per LED, each in the color the ring previews for it: the
+    // second color while it is being edited, otherwise the color the LED
+    // currently shows (the blink phase included, so the preview follows the
+    // colors on the fan).
+    for (index, color) in colors.iter().enumerate() {
         let (px, py) = point_at_radius(RING_RADIUS, led_angle(index));
         ctx.draw(&Points {
             coords: &[(px, py)],
-            color: to_ratatui_color(led.color()),
+            color: to_ratatui_color(*color),
         });
     }
 
@@ -865,7 +948,7 @@ fn paint_fan(ctx: &mut Context, app: &App, width: u16, height: u16) {
     // on any color. The selected LED's number is bold in single-LED mode.
     for (index, led) in app.leds.indexed() {
         let (lx, ly) = point_at_radius(LABEL_RADIUS, led_angle(index));
-        let fg = to_ratatui_color(led.color().inverse());
+        let fg = to_ratatui_color(colors[index].inverse());
         let style = if !all_mode && index == selected_index {
             Style::default().fg(fg).add_modifier(Modifier::BOLD)
         } else {
@@ -933,22 +1016,24 @@ fn block_edges(index: usize, inner: Rect) -> (u16, u16) {
     )
 }
 
-/// Title bar: app name, the active target (a LED, or all of them), and its
-/// color.
+/// Title bar: app name, the active target (a LED, or all of them), the color
+/// the color keys are editing on it, and a marker while the second color is
+/// edited.
 fn title(app: &App) -> Paragraph<'static> {
     let selected = app.leds.selected();
-    let color = selected.color();
+    let color = app.leds.selected_active_color();
     let target = if app.leds.all_mode() {
         "ALL".to_string()
     } else {
         format!("LED {}", selected.number())
     };
+    let slot = if app.leds.editing_secondary() { " 2nd" } else { "" };
     Paragraph::new(Line::from(vec![
         Span::styled(
             " Framework Desktop Fan ",
             Style::default().add_modifier(Modifier::BOLD),
         ),
-        Span::raw(format!(" {target}  {}", rgb_readout(color))),
+        Span::raw(format!(" {target}{slot}  {}", rgb_readout(color))),
     ]))
 }
 
@@ -968,6 +1053,14 @@ fn key_hints() -> Line<'static> {
         Span::raw("rgb "),
         Span::styled(" c ", Style::default().fg(RColor::Cyan)),
         Span::raw("off "),
+        Span::styled(" w ", Style::default().fg(RColor::Cyan)),
+        Span::raw("rainbow "),
+        Span::styled(" m ", Style::default().fg(RColor::Cyan)),
+        Span::raw("2nd "),
+        Span::styled(" n ", Style::default().fg(RColor::Cyan)),
+        Span::raw("blink "),
+        Span::styled(" o p ", Style::default().fg(RColor::Cyan)),
+        Span::raw("brate "),
         Span::styled(" ←→ ", Style::default().fg(RColor::Cyan)),
         Span::raw("color "),
         Span::styled(" ↑↓ ", Style::default().fg(RColor::Cyan)),
@@ -999,25 +1092,37 @@ fn rotation_status(app: &App) -> String {
     format!("{direction} ({} hz)", app.leds.rotation_speed().hertz())
 }
 
+/// The blink state as reported in the status line: off, or on at the current
+/// rate.
+fn blink_status(app: &App) -> String {
+    if app.leds.blink_on() {
+        format!("on ({} hz)", app.leds.blink_speed().hertz())
+    } else {
+        "off".to_string()
+    }
+}
+
 /// The fan status line: the last fan error in red, or the target (a LED, or
-/// all of them), its color, and the rotation state in green.
+/// all of them), the color the color keys are editing on it, and the blink
+/// and rotation states in green.
 fn status_line(app: &App) -> Line<'static> {
     let rotation = rotation_status(app);
+    let blink = blink_status(app);
     if let Some(err) = &app.error {
         return Line::from(Span::styled(
-            format!("fan error: {err}   rotation: {rotation}"),
+            format!("fan error: {err}   blink: {blink}   rotation: {rotation}"),
             Style::default().fg(RColor::Red),
         ));
     }
     let selected = app.leds.selected();
-    let color = selected.color();
+    let color = app.leds.selected_active_color();
     let target = if app.leds.all_mode() {
         "ALL LEDs".to_string()
     } else {
         format!("LED {} selected", selected.number())
     };
     let status = format!(
-        "fan: {LED_COUNT} LEDs, {target}  {}   rotation: {rotation}",
+        "fan: {LED_COUNT} LEDs, {target}  {}   blink: {blink}   rotation: {rotation}",
         rgb_readout(color)
     );
     Line::from(Span::styled(status, Style::default().fg(RColor::Green)))
@@ -1199,6 +1304,38 @@ mod tests {
         assert!(
             reds > 50,
             "expected a disc filled with red dots, found {reds} red cells"
+        );
+    }
+
+    /// While the color keys edit the second color, the ring shows the second
+    /// colors (LED 2's blue wedge), not the main ones.
+    #[test]
+    fn frame_shows_the_second_colors_while_editing_them() {
+        let mut leds = red_bank(); // every LED's main color is red
+        leds.select(2);
+        leds.toggle_editing();
+        leds.set_color(Color::new(0, 0, 255)); // LED 2's second color is blue
+        assert!(leds.editing_secondary(), "editing the second color");
+        let app = App::new(leds);
+
+        let mut terminal =
+            Terminal::new(TestBackend::new(80, 40)).expect("test backend should initialize");
+        terminal
+            .draw(|frame| draw(frame, &app))
+            .expect("draw should not fail");
+
+        let content = terminal.backend_mut().buffer().content();
+        let blue = RColor::Rgb(0, 0, 255);
+        let blues = content.iter().filter(|cell| cell.fg == blue).count();
+        let red = RColor::Rgb(255, 0, 0);
+        let reds = content.iter().filter(|cell| cell.fg == red).count();
+        assert!(
+            blues > 5,
+            "LED 2's wedge should be filled with its second color, found {blues}"
+        );
+        assert_eq!(
+            reds, 0,
+            "the main colors should not be shown while editing the second color"
         );
     }
 
@@ -1483,6 +1620,152 @@ mod tests {
             colors[0],
             Color::new(2, 0, 0),
             "LED 2's color lands on LED 1"
+        );
+    }
+
+    /// `m` toggles which color the color keys edit: while it edits the second
+    /// color, a key changes the second one (the main color is untouched), the
+    /// color bar's pointer follows the active color, and `m` itself writes no
+    /// fan.
+    #[test]
+    fn m_toggles_which_color_the_color_keys_edit() {
+        let fan = CountingFan::default();
+        let mut app = App::new(red_bank());
+        assert!(!app.leds.editing_secondary(), "the keys edit the main color by default");
+        assert_eq!(app.color_bar.pos, 11, "the pointer starts at the selected red");
+
+        assert!(
+            app.handle_key(key(KeyCode::Char('m')), &fan),
+            "m keeps the app running"
+        );
+        assert!(app.leds.editing_secondary(), "m switches to editing the second color");
+        assert_eq!(
+            app.color_bar.pos,
+            0,
+            "the pointer follows the second color (off, i.e. black)"
+        );
+        assert_eq!(fan.writes.get(), 0, "m itself does not write the fan");
+
+        assert!(
+            app.handle_key(key(KeyCode::Char('g')), &fan),
+            "g keeps the app running"
+        );
+        assert_eq!(
+            app.leds.selected().color(),
+            Color::new(255, 0, 0),
+            "the main color is untouched"
+        );
+        assert_eq!(
+            app.leds.selected().secondary(),
+            Color::new(0, 1, 0),
+            "the key adjusts the second color (which started off)"
+        );
+
+        assert!(app.handle_key(key(KeyCode::Char('m')), &fan));
+        assert!(!app.leds.editing_secondary(), "m returns to editing the main color");
+        assert_eq!(fan.writes.get(), 1, "the color key wrote the fan");
+    }
+
+    /// `n` toggles the two-color blink: turning it on starts on the main
+    /// colors (already on the fan, so no write), and one blink step (as the
+    /// event loop performs it) changes to the second colors and writes the
+    /// fan.
+    #[test]
+    fn n_toggles_the_blink_and_a_step_writes_the_fan() {
+        let fan = CountingFan::default();
+        let mut app = App::new(red_bank());
+        app.leds.toggle_editing();
+        app.leds.set_color(Color::new(0, 0, 255)); // LED 1's second color is blue
+        app.leds.toggle_editing();
+
+        assert!(
+            app.handle_key(key(KeyCode::Char('n')), &fan),
+            "n keeps the app running"
+        );
+        assert!(app.leds.blink_on(), "n turns the blink on");
+        assert_eq!(
+            app.leds.colors()[0],
+            Color::new(255, 0, 0),
+            "the blink starts on the main color"
+        );
+        assert_eq!(fan.writes.get(), 0, "n itself does not write the fan");
+
+        // One tick, as the event loop performs it.
+        app.leds.blink_step();
+        app.apply(&fan);
+        assert_eq!(
+            app.leds.colors()[0],
+            Color::new(0, 0, 255),
+            "the step shows the second color"
+        );
+        assert_eq!(fan.writes.get(), 1, "the blink step writes the fan");
+
+        assert!(app.handle_key(key(KeyCode::Char('n')), &fan));
+        assert!(!app.leds.blink_on(), "n turns the blink off again");
+        assert_eq!(
+            app.leds.colors()[0],
+            Color::new(255, 0, 0),
+            "off: the main color shows again"
+        );
+    }
+
+    /// `o` and `p` change the blink rate (1 hz steps at the default 1 hz and
+    /// above), and neither writes the fan.
+    #[test]
+    fn o_and_p_change_the_blink_rate_without_a_write() {
+        let fan = CountingFan::default();
+        let mut app = App::new(red_bank());
+        assert_eq!(app.leds.blink_speed().hertz(), 1.0, "the default rate");
+
+        assert!(
+            app.handle_key(key(KeyCode::Char('p')), &fan),
+            "p keeps the app running"
+        );
+        assert_eq!(app.leds.blink_speed().hertz(), 2.0, "p raises the rate by 1 hz");
+        assert!(
+            app.handle_key(key(KeyCode::Char('o')), &fan),
+            "o keeps the app running"
+        );
+        assert!(app.handle_key(key(KeyCode::Char('o')), &fan));
+        assert_eq!(
+            app.leds.blink_speed().hertz(),
+            0.9,
+            "o twice lowers the rate into the fine range"
+        );
+
+        assert_eq!(fan.writes.get(), 0, "changing the rate does not write the fan");
+    }
+
+    /// The footer reports the blink as off by default and on with its rate.
+    #[test]
+    fn the_footer_reports_the_blink_state() {
+        let footer_text = |app: &App| {
+            let mut terminal =
+                Terminal::new(TestBackend::new(100, 24)).expect("test backend");
+            terminal
+                .draw(|frame| draw(frame, app))
+                .expect("draw should not fail");
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol().to_string())
+                .collect::<String>()
+        };
+
+        let off = App::new(red_bank());
+        assert!(
+            footer_text(&off).contains("blink: off"),
+            "the blink is off by default"
+        );
+
+        let mut on = App::new(red_bank());
+        on.leds.toggle_blink();
+        assert!(on.leds.blink_on(), "the blink is on");
+        assert!(
+            footer_text(&on).contains("blink: on (1 hz)"),
+            "the blink is reported with its rate"
         );
     }
 
@@ -1819,36 +2102,75 @@ mod tests {
         assert!(!text.contains("RPM"), "no fan data before the first read");
     }
 
-    /// `next_wait` returns the soonest of the rotation shift, the thermal
-    /// refresh, and the poll timeout.
+    /// `next_wait` returns the soonest of the rotation shift, the blink step,
+    /// the thermal refresh, and the poll timeout.
     #[test]
     fn next_wait_picks_the_soonest_deadline() {
         let now = Instant::now();
         let shift = Duration::from_millis(125); // the default rotation interval
+        let blink = Duration::from_secs(1); // the default blink interval
         assert_eq!(
-            next_wait(None, false, now + Duration::from_secs(10), now),
+            next_wait(None, false, None, false, now + Duration::from_secs(10), now),
             POLL_TIMEOUT,
             "when idle, wait the poll timeout"
         );
         assert_eq!(
-            next_wait(None, false, now + Duration::from_millis(50), now),
+            next_wait(None, false, None, false, now + Duration::from_millis(50), now),
             Duration::from_millis(50),
             "a soon thermal refresh waits less"
         );
         assert_eq!(
-            next_wait(Some(now + shift), true, now + Duration::from_secs(10), now),
+            next_wait(Some(now + shift), true, None, false, now + Duration::from_secs(10), now),
             shift,
             "while rotating, wait the shift interval"
         );
         assert_eq!(
-            next_wait(Some(now + shift), true, now + Duration::from_millis(50), now),
+            next_wait(
+                None,
+                false,
+                Some(now + blink),
+                true,
+                now + Duration::from_secs(10),
+                now
+            ),
+            blink,
+            "while blinking, wait the blink interval"
+        );
+        assert_eq!(
+            next_wait(Some(now + shift), true, None, false, now + Duration::from_millis(50), now),
             Duration::from_millis(50),
             "a soon thermal refresh beats the next shift"
         );
         assert_eq!(
             next_wait(
+                None,
+                false,
+                Some(now + blink),
+                true,
+                now + Duration::from_millis(50),
+                now
+            ),
+            Duration::from_millis(50),
+            "a soon thermal refresh beats the next blink step"
+        );
+        assert_eq!(
+            next_wait(
+                Some(now + shift),
+                true,
+                Some(now + blink),
+                true,
+                now + Duration::from_secs(10),
+                now
+            ),
+            shift,
+            "the soonest of a blink step and a shift wins"
+        );
+        assert_eq!(
+            next_wait(
                 Some(now - Duration::from_secs(1)),
                 true,
+                None,
+                false,
                 now + Duration::from_secs(10),
                 now
             ),
@@ -2135,6 +2457,39 @@ mod tests {
             }
         }
         assert_eq!(fan.writes.get(), 1, "the new color is written to the fan");
+    }
+
+    /// `w` toggles the rainbow preset: the first press applies it (the whole
+    /// ring, even in single-LED mode), the second restores the previous
+    /// colors; each press writes the fan.
+    #[test]
+    fn w_toggles_between_the_rainbow_and_the_previous_colors() {
+        let fan = CountingFan::default();
+        let mut app = App::new(red_bank());
+        app.leds.select(3);
+
+        assert!(
+            app.handle_key(key(KeyCode::Char('w')), &fan),
+            "w keeps the app running"
+        );
+        assert_eq!(
+            app.leds.colors(),
+            LedBank::rainbow().colors(),
+            "the first w applies the rainbow"
+        );
+        assert!(app.leds.rainbow_on());
+
+        assert!(
+            app.handle_key(key(KeyCode::Char('w')), &fan),
+            "w keeps the app running"
+        );
+        assert_eq!(
+            app.leds.colors(),
+            red_bank().colors(),
+            "the second w restores the previous colors"
+        );
+        assert!(!app.leds.rainbow_on());
+        assert_eq!(fan.writes.get(), 2, "each press writes the fan");
     }
 
     /// In all-mode, `c` blacks out every LED.

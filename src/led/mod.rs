@@ -12,6 +12,9 @@
 //! - `r`/`R`, `g`/`G`, `b`/`B` — increase / decrease the selected channel
 //! - `c` — toggle the target LED(s) between off (black) and the color they
 //!   had before
+//! - `w` — toggle the rainbow preset: on, every LED takes one hue of the
+//!   color wheel (the whole ring, regardless of the selected LED or all-mode,
+//!   remembering the previous colors); off, the previous colors are restored
 //! - `a` — toggle all-mode: color changes apply to every LED
 //! - `t` — toggle the rotation: the colors travel around the ring, one
 //!   position per step (the TUI steps them at the current rotation speed while
@@ -20,12 +23,24 @@
 //!   while every LED is off
 //! - `+`/`-` — increase / decrease the rotation speed ([`RotationSpeed`]),
 //!   from 0.1 to 10 hz; does nothing while every LED is off
+//! - `m` — toggle which of the LED's two colors the color keys are editing:
+//!   the main color or the second one (off by default, editing the main color)
+//! - `n` — toggle the two-color blink: while on, every LED changes between its
+//!   two colors at the blink rate ([`BlinkSpeed`])
+//! - `o`/`p` — decrease / increase the blink rate, from 0.1 to 10 hz
+//!
+//! Each LED holds two colors: the main color (shown while the blink is off,
+//! and the one `c`, the rainbow preset, and the rotation act on) and a second
+//! color it blinks to while the blink is on. The second color starts off
+//! (black), so a blink runs between the main color and off until it is set.
 
 mod bank;
+mod blink;
 mod channel;
 mod rotation;
 
 pub use bank::LedBank;
+pub use blink::BlinkSpeed;
 pub use channel::Channel;
 pub use rotation::{RotationDirection, RotationSpeed};
 
@@ -39,7 +54,12 @@ pub const COLOR_STEP: i16 = 1;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Led {
     number: u8,
+    /// The LED's main color: shown while the blink is off, and the one `c`,
+    /// the rainbow preset, and the rotation act on.
     color: Color,
+    /// The LED's second color: the one it blinks to while the blink is on.
+    /// Off (black) by default.
+    secondary: Color,
     /// The color the LED had when it was toggled off (black), so that
     /// toggling it back on restores it. `None` when there is nothing to
     /// restore.
@@ -51,6 +71,7 @@ impl Led {
         Self {
             number,
             color,
+            secondary: Color::BLACK,
             previous: None,
         }
     }
@@ -60,19 +81,35 @@ impl Led {
         self.number
     }
 
-    /// The LED's current color.
+    /// The LED's main color (shown while the blink is off).
     pub fn color(&self) -> Color {
         self.color
     }
 
-    /// Set the LED's color.
+    /// The LED's second color (the one it blinks to while the blink is on).
+    pub fn secondary(&self) -> Color {
+        self.secondary
+    }
+
+    /// Set the LED's main color.
     pub fn set_color(&mut self, color: Color) {
         self.color = color;
     }
 
-    /// Add `step` to one channel of the LED's color, clamped to `0..=255`.
+    /// Set the LED's second color (the blink target).
+    pub fn set_secondary(&mut self, color: Color) {
+        self.secondary = color;
+    }
+
+    /// Add `step` to one channel of the LED's main color, clamped to `0..=255`.
     pub fn adjust(&mut self, channel: Channel, step: i16) {
         channel.adjust(&mut self.color, step);
+    }
+
+    /// Add `step` to one channel of the LED's second color, clamped to
+    /// `0..=255`.
+    pub fn adjust_secondary(&mut self, channel: Channel, step: i16) {
+        channel.adjust(&mut self.secondary, step);
     }
 
     /// Toggle the LED between off (black) and on: a lit LED is blacked out,
@@ -102,6 +139,23 @@ mod tests {
         assert_eq!(led.color(), Color::new(1, 2, 3));
         led.set_color(Color::new(4, 5, 6));
         assert_eq!(led.color(), Color::new(4, 5, 6));
+    }
+
+    /// A new LED's second color is off (black); `set_secondary` and
+    /// `adjust_secondary` change only the second color, leaving the main one
+    /// alone.
+    #[test]
+    fn led_holds_a_second_color_separate_from_the_main_one() {
+        let mut led = Led::new(3, Color::new(255, 0, 0));
+        assert_eq!(led.secondary(), Color::BLACK, "the second color starts off");
+
+        led.set_secondary(Color::new(0, 0, 255));
+        assert_eq!(led.secondary(), Color::new(0, 0, 255));
+        assert_eq!(led.color(), Color::new(255, 0, 0), "the main color is untouched");
+
+        led.adjust_secondary(Channel::Green, 16);
+        assert_eq!(led.secondary(), Color::new(0, 16, 255));
+        assert_eq!(led.color(), Color::new(255, 0, 0), "adjusting it leaves the main color alone");
     }
 
     /// `toggle_off` blacks out a lit LED, remembering its color; toggling

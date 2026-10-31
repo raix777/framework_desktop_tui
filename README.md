@@ -13,10 +13,18 @@ number sits in its LED's wedge, drawn in the inverse of the wedge's color
 (e.g. a red wedge gets a cyan number) so it stays readable on any color.
 Select a LED with the `1` to `8` keys and adjust its color independently —
 each LED keeps its own color, written straight to the embedded controller (EC).
-Toggle `t` and the colors travel around the ring instead: every 1/8 of a
-second the color of LED 1 moves to position 8, the color of 8 to position 7,
-and so on (one full turn per second); `s` flips the direction between
-clockwise and counter-clockwise.
+Toggle `t` and the colors travel around the ring instead: the color of LED 1
+moves to position 8, the color of 8 to position 7, and so on (one full turn
+per second by default); `s` flips the direction between clockwise and
+counter-clockwise, and `+`/`-` set the rotation speed (0.1 to 10 hz).
+
+Each LED can hold a second color. `m` switches the color keys between the
+main and the second color, `p` toggles the two-color blink, and while it is
+on every LED changes between its two colors at the blink rate (one change per
+second by default, `[`/`]` set the rate from 0.1 to 10 hz). A second color
+starts off (black), so a blink runs between the main color and off until it
+is set. Like the rotation, the second colors and the blink are not kept
+between runs — only the main colors are restored on start.
 
 A vertical bar to the left of the circle shows the fan speed in percent.
 `Up` and `Down` move it by 3% at a time (clamped to 0–100%), and `x` toggles
@@ -51,11 +59,25 @@ sudo ./target/release/framework_desktop_tui
 | `r` / `R`  | increase / decrease red                            |
 | `g` / `G`  | increase / decrease green                          |
 | `b` / `B`  | increase / decrease blue                           |
+| `m`        | toggle which color the color keys edit: the LED's  |
+|            | main color or its second one (off by default)      |
+| `c`        | toggle the target LED between off (black) and the  |
+|            | color it had before                                |
+| `w`        | toggle the rainbow preset: every LED takes one hue |
+|            | of the color wheel (LED 1 red, stepping around the |
+|            | ring); toggling off restores the previous colors   |
+| `p`        | toggle the two-color blink: every LED changes      |
+|            | between its two colors at the blink rate (one      |
+|            | change per second by default)                      |
+| `[`/`]`    | decrease / increase the blink rate (color changes  |
+|            | per second, 0.1 to 10 hz)                          |
 | `t`        | toggle the rotation: while on, the colors shift one|
-|            | position around the ring every 1/8 s (one full     |
-|            | turn per second)                                   |
+|            | position around the ring at the rotation speed (one|
+|            | full turn per second by default)                   |
 | `s`        | flip the rotation direction (clockwise /           |
 |            | counter-clockwise)                                 |
+| `+`/`-`    | increase / decrease the rotation speed (full       |
+|            | rotations per second, 0.1 to 10 hz)               |
 | `Up`/`Down`| increase / decrease the fan speed by 3%; while the |
 |            | automatic control is on the value is stored and    |
 |            | applied when it is switched off                    |

@@ -1,4 +1,5 @@
 use super::Led;
+use super::blink::BlinkSpeed;
 use super::channel::Channel;
 use super::rotation::{RotationDirection, RotationSpeed};
 use crate::fan::{Color, LED_COUNT};
@@ -8,15 +9,40 @@ use crate::fan::{Color, LED_COUNT};
 /// The LEDs are numbered 1..=LED_COUNT. Color changes target the selected
 /// LED, or every LED when all-mode is on; [`colors`](Self::colors) yields the
 /// whole set in order for `FanController::write`.
+///
+/// Each LED has two colors: the main color and a second one it blinks to. The
+/// color keys edit whichever color is active (the main one by default); the
+/// two-color blink, while on, makes every LED change between its two colors at
+/// the blink rate.
 #[derive(Debug)]
 pub struct LedBank {
     leds: [Led; LED_COUNT],
     /// 0-based index of the selected LED.
     selected: usize,
     all_mode: bool,
+    /// Whether the color keys are editing the second color (instead of the
+    /// main one). Off by default.
+    editing_secondary: bool,
+    /// Whether the two-color blink is on. Off by default.
+    blink: bool,
+    /// Which of the two colors is shown while the blink is on: the second
+    /// color when true, the main color when false.
+    phase: bool,
+    /// The blink rate (color changes per second) while the blink is on.
+    blink_speed: BlinkSpeed,
     rotation: bool,
     direction: RotationDirection,
     rotation_speed: RotationSpeed,
+    /// The colors in effect before the rainbow preset was last applied, so
+    /// that toggling the rainbow off restores them. `None` while the rainbow
+    /// is not applied.
+    rainbow_previous: Option<[Color; LED_COUNT]>,
+}
+
+/// The rainbow colors in ring order: LED `i` shows hue `i · 360/LED_COUNT`,
+/// so the LEDs run around the color wheel starting at red (LED 1).
+fn rainbow_colors() -> [Color; LED_COUNT] {
+    std::array::from_fn(|index| Color::from_hue(360.0 * index as f64 / LED_COUNT as f64))
 }
 
 impl LedBank {
@@ -29,18 +55,20 @@ impl LedBank {
             leds,
             selected: 0,
             all_mode: false,
+            editing_secondary: false,
+            blink: false,
+            phase: false,
+            blink_speed: BlinkSpeed::new(),
             rotation: false,
             direction: RotationDirection::Clockwise,
             rotation_speed: RotationSpeed::new(),
+            rainbow_previous: None,
         }
     }
 
-    /// Build a bank with a rainbow: LED `i` shows hue `i · 360/LED_COUNT`, so
-    /// the LEDs run around the color wheel starting at red (LED 1).
+    /// Build a bank with a rainbow (see [`rainbow_colors`]).
     pub fn rainbow() -> Self {
-        let colors =
-            std::array::from_fn(|index| Color::from_hue(360.0 * index as f64 / LED_COUNT as f64));
-        Self::from_colors(colors)
+        Self::from_colors(rainbow_colors())
     }
 }
 
@@ -91,20 +119,103 @@ impl LedBank {
         self.all_mode
     }
 
-    /// Add `step` to one channel of the target LED(s).
-    pub fn adjust(&mut self, channel: Channel, step: i16) {
-        self.update_targets(|led| led.adjust(channel, step));
+    /// Whether the color keys are editing the second color (instead of the
+    /// main one).
+    pub fn editing_secondary(&self) -> bool {
+        self.editing_secondary
     }
 
-    /// Set the target LED(s) to `color`.
+    /// Toggle which color the color keys are editing (main ↔ second). Returns
+    /// the new state (`true` while editing the second color).
+    pub fn toggle_editing(&mut self) -> bool {
+        self.editing_secondary = !self.editing_secondary;
+        self.editing_secondary
+    }
+
+    /// The color the color keys would change on the selected LED: its color in
+    /// the active slot. Used by the color bar and the title.
+    pub fn selected_active_color(&self) -> Color {
+        let led = &self.leds[self.selected];
+        if self.editing_secondary {
+            led.secondary()
+        } else {
+            led.color()
+        }
+    }
+
+    /// Every LED's color in the active slot (in ring order): the second
+    /// colors while the color keys edit them, and the colors the LEDs
+    /// currently show (see [`Self::colors`]) otherwise. Used by the fan ring,
+    /// which previews the colors being edited.
+    pub fn active_colors(&self) -> Vec<Color> {
+        if self.editing_secondary {
+            self.leds.iter().map(|led| led.secondary()).collect()
+        } else {
+            self.colors()
+        }
+    }
+
+    /// Add `step` to one channel of the active color of the target LED(s).
+    pub fn adjust(&mut self, channel: Channel, step: i16) {
+        let editing_secondary = self.editing_secondary;
+        self.update_targets(|led| {
+            if editing_secondary {
+                led.adjust_secondary(channel, step);
+            } else {
+                led.adjust(channel, step);
+            }
+        });
+    }
+
+    /// Set the active color of the target LED(s) to `color`.
     pub fn set_color(&mut self, color: Color) {
-        self.update_targets(|led| led.set_color(color));
+        let editing_secondary = self.editing_secondary;
+        self.update_targets(|led| {
+            if editing_secondary {
+                led.set_secondary(color);
+            } else {
+                led.set_color(color);
+            }
+        });
     }
 
     /// Toggle the target LED(s) between off (black) and the color they had
     /// before.
     pub fn toggle_off(&mut self) {
         self.update_targets(|led| led.toggle_off());
+    }
+
+    /// Apply the rainbow preset: every LED takes its rainbow hue (the whole
+    /// ring, regardless of the selected LED or all-mode).
+    pub fn apply_rainbow(&mut self) {
+        self.set_all(rainbow_colors());
+    }
+
+    /// Set every LED to the given colors (in ring order).
+    fn set_all(&mut self, colors: [Color; LED_COUNT]) {
+        for (led, color) in self.leds.iter_mut().zip(colors) {
+            led.set_color(color);
+        }
+    }
+
+    /// Whether the rainbow preset is currently applied.
+    pub fn rainbow_on(&self) -> bool {
+        self.rainbow_previous.is_some()
+    }
+
+    /// Toggle the rainbow preset: while it is not applied, the current colors
+    /// are remembered and the rainbow is applied; while it is applied, the
+    /// remembered colors are restored. Returns the new state.
+    pub fn toggle_rainbow(&mut self) -> bool {
+        match self.rainbow_previous.take() {
+            Some(previous) => self.set_all(previous),
+            None => {
+                let current: [Color; LED_COUNT] = self.leds.map(|led| led.color());
+                self.apply_rainbow();
+                self.rainbow_previous = Some(current);
+            }
+        }
+        self.rainbow_on()
     }
 
     /// Apply `update` to the target LED(s): every LED when all-mode is on,
@@ -186,6 +297,42 @@ impl LedBank {
 }
 
 impl LedBank {
+    /// Whether the two-color blink is on.
+    pub fn blink_on(&self) -> bool {
+        self.blink
+    }
+
+    /// Toggle the two-color blink. Turning it on starts on the main color, so
+    /// the first step is the first change to the second color. Returns the new
+    /// state.
+    pub fn toggle_blink(&mut self) -> bool {
+        self.blink = !self.blink;
+        self.phase = false;
+        self.blink
+    }
+
+    /// The blink rate (color changes per second) while the blink is on.
+    pub fn blink_speed(&self) -> BlinkSpeed {
+        self.blink_speed
+    }
+
+    /// Increase the blink rate by one step.
+    pub fn increase_blink_speed(&mut self) {
+        self.blink_speed.increase();
+    }
+
+    /// Decrease the blink rate by one step.
+    pub fn decrease_blink_speed(&mut self) {
+        self.blink_speed.decrease();
+    }
+
+    /// Advance the blink by one step: flip which of the two colors is shown.
+    pub fn blink_step(&mut self) {
+        self.phase = !self.phase;
+    }
+}
+
+impl LedBank {
     /// Whether at least one LED is lit (i.e. not black).
     pub fn any_lit(&self) -> bool {
         self.leds.iter().any(|led| led.color() != Color::BLACK)
@@ -196,8 +343,20 @@ impl LedBank {
         self.leds.iter().enumerate()
     }
 
-    /// The colors of all LEDs in ring order.
+    /// The colors the LEDs currently show (in ring order), for writing to the
+    /// fan: the main colors while the blink is off, and the second colors
+    /// while it is on and its phase shows them.
     pub fn colors(&self) -> Vec<Color> {
+        if self.blink && self.phase {
+            self.leds.iter().map(|led| led.secondary()).collect()
+        } else {
+            self.leds.iter().map(|led| led.color()).collect()
+        }
+    }
+
+    /// The LEDs' main colors in ring order: what the app persists, because the
+    /// second colors and the blink are session state (like the rotation).
+    pub fn primary_colors(&self) -> Vec<Color> {
         self.leds.iter().map(|led| led.color()).collect()
     }
 }
@@ -620,6 +779,68 @@ mod tests {
         }
     }
 
+    /// `apply_rainbow` sets every LED to its rainbow hue (the whole ring,
+    /// regardless of the selected LED or all-mode), leaving the selection and
+    /// all-mode untouched.
+    #[test]
+    fn apply_rainbow_sets_every_led_to_its_hue() {
+        let mut bank = red_bank();
+        bank.select(3);
+        bank.toggle_all();
+
+        bank.apply_rainbow();
+
+        assert_eq!(
+            bank.colors(),
+            LedBank::rainbow().colors(),
+            "every LED takes its rainbow hue"
+        );
+        assert_eq!(bank.selected().number(), 3, "the selection is untouched");
+        assert!(bank.all_mode(), "all-mode is untouched");
+    }
+
+    /// `toggle_rainbow` applies the rainbow (remembering the current colors),
+    /// and the next toggle restores those colors; a third toggle saves and
+    /// applies the rainbow again.
+    #[test]
+    fn toggle_rainbow_restores_the_previous_colors() {
+        let mut bank = red_bank();
+        assert!(!bank.rainbow_on(), "the rainbow is not applied at first");
+
+        assert!(bank.toggle_rainbow(), "the first toggle applies the rainbow");
+        assert_eq!(bank.colors(), LedBank::rainbow().colors());
+        assert!(bank.rainbow_on());
+
+        assert!(!bank.toggle_rainbow(), "the second toggle removes the rainbow");
+        assert_eq!(
+            bank.colors(),
+            red_bank().colors(),
+            "the previous colors are restored"
+        );
+        assert!(!bank.rainbow_on());
+
+        assert!(bank.toggle_rainbow(), "the third toggle applies the rainbow again");
+        assert_eq!(bank.colors(), LedBank::rainbow().colors());
+    }
+
+    /// Toggling off restores the colors from before the rainbow, even if the
+    /// rainbow was edited in the meantime.
+    #[test]
+    fn toggle_rainbow_off_restores_the_colors_from_before_the_rainbow() {
+        let mut bank = red_bank();
+        bank.toggle_rainbow();
+        bank.select(2);
+        bank.set_color(Color::WHITE); // edit the rainbow
+
+        bank.toggle_rainbow();
+
+        assert_eq!(
+            bank.colors(),
+            red_bank().colors(),
+            "the pre-rainbow colors come back, not the edited rainbow"
+        );
+    }
+
     /// The rainbow spreads one hue per LED around the wheel: LED 1 starts at
     /// red, no two LEDs share a color, and every LED is lit.
     #[test]
@@ -675,5 +896,122 @@ mod tests {
         let mut one_lit = [Color::BLACK; LED_COUNT];
         one_lit[3] = Color::new(1, 0, 0);
         assert!(LedBank::from_colors(one_lit).any_lit(), "one lit LED is on");
+    }
+
+    /// `toggle_editing` flips which color the color keys target (the main
+    /// color by default); while it targets the second color, `set_color` and
+    /// `adjust` act on the second one and leave the main color alone.
+    #[test]
+    fn toggle_editing_switches_the_color_the_keys_target() {
+        let mut bank = red_bank();
+        assert!(!bank.editing_secondary(), "the keys target the main color by default");
+
+        bank.select(2);
+        assert!(bank.toggle_editing(), "the first toggle turns on second-color editing");
+
+        bank.set_color(Color::new(0, 0, 255));
+        assert_eq!(bank.colors()[1], Color::new(255, 0, 0), "the main color is untouched");
+        assert_eq!(bank.leds[1].secondary(), Color::new(0, 0, 255), "the second color is set");
+
+        bank.adjust(Channel::Green, 16);
+        assert_eq!(bank.leds[1].secondary(), Color::new(0, 16, 255), "adjust hits the second color");
+
+        assert!(!bank.toggle_editing(), "the next toggle returns to the main color");
+        bank.set_color(Color::WHITE);
+        assert_eq!(bank.colors()[1], Color::WHITE, "the main color is set again");
+    }
+
+    /// `selected_active_color` yields the selected LED's color in the active
+    /// slot: the main color by default, the second one while editing it.
+    #[test]
+    fn selected_active_color_follows_the_active_slot() {
+        let mut bank = red_bank();
+        bank.select(2);
+        bank.toggle_editing();
+        bank.set_color(Color::new(0, 0, 255));
+
+        assert_eq!(bank.selected_active_color(), Color::new(0, 0, 255), "the active (second) color");
+        bank.toggle_editing();
+        assert_eq!(bank.selected_active_color(), Color::new(255, 0, 0), "back to the main color");
+    }
+
+    /// `active_colors` yields every LED's color in the active slot: the colors
+    /// the LEDs currently show (see `colors`) by default, and the second
+    /// colors while editing them.
+    #[test]
+    fn active_colors_follow_the_active_slot() {
+        let mut bank = red_bank();
+        bank.select(2);
+        bank.toggle_editing();
+        bank.set_color(Color::new(0, 0, 255)); // LED 2's second color is blue
+
+        let active = bank.active_colors();
+        assert_eq!(active[1], Color::new(0, 0, 255), "the active (second) color");
+        assert_eq!(active[0], Color::BLACK, "LED 1's second color is off by default");
+
+        bank.toggle_editing();
+        assert_eq!(
+            bank.active_colors(),
+            bank.colors(),
+            "back to the colors the LEDs show"
+        );
+    }
+
+    /// The blink starts off and shows the main color; while on, each
+    /// `blink_step` flips between the main and second colors, and toggling off
+    /// shows the main color again.
+    #[test]
+    fn blink_steps_alternate_between_the_two_colors() {
+        let mut bank = red_bank();
+        bank.select(2);
+        bank.toggle_editing();
+        bank.set_color(Color::new(0, 0, 255)); // LED 2's second color is blue
+        bank.toggle_editing();
+
+        assert!(!bank.blink_on(), "the blink is off by default");
+        assert_eq!(bank.colors()[1], Color::new(255, 0, 0), "off: the main color shows");
+
+        assert!(bank.toggle_blink(), "the first toggle turns the blink on");
+        assert_eq!(bank.colors()[1], Color::new(255, 0, 0), "on: it starts on the main color");
+
+        bank.blink_step();
+        assert_eq!(bank.colors()[1], Color::new(0, 0, 255), "a step shows the second color");
+        bank.blink_step();
+        assert_eq!(bank.colors()[1], Color::new(255, 0, 0), "and the next step returns to the main color");
+
+        assert!(!bank.toggle_blink(), "the next toggle turns the blink off");
+        assert_eq!(bank.colors()[1], Color::new(255, 0, 0), "off: the main color shows again");
+    }
+
+    /// `primary_colors` always yields the main colors, even while the blink is
+    /// on and showing the second ones.
+    #[test]
+    fn primary_colors_ignore_the_blink_phase() {
+        let mut bank = red_bank();
+        bank.toggle_blink();
+        bank.blink_step(); // now showing the (all-black) second colors
+        assert_eq!(
+            bank.colors(),
+            vec![Color::BLACK; LED_COUNT],
+            "the blink is showing the second (black) colors"
+        );
+        assert_eq!(
+            bank.primary_colors(),
+            vec![Color::new(255, 0, 0); LED_COUNT],
+            "the persisted colors stay the main ones"
+        );
+    }
+
+    /// The blink rate starts at the default (1 hz) and steps with the same
+    /// stops as the rotation speed.
+    #[test]
+    fn the_blink_rate_steps_through_the_bank() {
+        let mut bank = red_bank();
+        assert_eq!(bank.blink_speed().hertz(), 1.0, "the default rate");
+        bank.increase_blink_speed();
+        assert_eq!(bank.blink_speed().hertz(), 2.0, "] steps up by 1 hz");
+        bank.decrease_blink_speed();
+        bank.decrease_blink_speed();
+        assert_eq!(bank.blink_speed().hertz(), 0.9, "[ steps down to the fine range");
     }
 }
