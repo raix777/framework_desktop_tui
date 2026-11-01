@@ -2906,4 +2906,201 @@ mod tests {
             .collect::<Vec<_>>()
             .concat()
     }
+
+    /// Capture a short scripted demo as frame files (no hardware or terminal
+    /// needed) so a GIF can be rendered from them (see `tools/render_demo.py`).
+    /// A no-op unless the `CAPTURE_DEMO_DIR` environment variable is set, so
+    /// `cargo test` stays clean and fast.
+    #[test]
+    fn capture_demo_if_requested() {
+        let Some(dir) = std::env::var_os("CAPTURE_DEMO_DIR") else {
+            return;
+        };
+        let dir = std::path::Path::new(&dir);
+        std::fs::create_dir_all(dir).expect("create the capture dir");
+        for entry in std::fs::read_dir(dir).expect("read the capture dir").flatten() {
+            if entry.path().is_file() {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+
+        let fan = DemoFan;
+        let mut terminal = Terminal::new(TestBackend::new(100, 34)).expect("test backend");
+        let mut app = App::new(LedBank::rainbow());
+        app.read_thermal(&fan);
+
+        let mut frames = 0;
+        let mut snap = |terminal: &mut Terminal<TestBackend>, app: &App| {
+            let path = dir.join(format!("frame_{frames:04}.txt"));
+            terminal
+                .draw(|frame| draw(frame, app))
+                .expect("draw should not fail");
+            write_frame(&path, terminal.backend().buffer());
+            frames += 1;
+        };
+        let press = |app: &mut App, code: KeyCode| {
+            let keep_running = app.handle_key(KeyEvent::new(code, KeyModifiers::NONE), &fan);
+            assert!(keep_running, "the demo should not quit");
+        };
+
+        // 1. Start: the rainbow, LED 1 selected.
+        for _ in 0..4 {
+            snap(&mut terminal, &app);
+        }
+
+        // 2. Rotate the main layer one full turn (8 shifts), clockwise.
+        press(&mut app, KeyCode::Char('t'));
+        snap(&mut terminal, &app);
+        for _ in 0..LED_COUNT {
+            app.leds.rotate_layer(false);
+            app.apply(&fan);
+            snap(&mut terminal, &app);
+        }
+        press(&mut app, KeyCode::Char('t'));
+        for _ in 0..2 {
+            snap(&mut terminal, &app);
+        }
+
+        // 3. Select LED 3 and step its color through the color bar.
+        press(&mut app, KeyCode::Char('3'));
+        for _ in 0..2 {
+            snap(&mut terminal, &app);
+        }
+        for _ in 0..6 {
+            press(&mut app, KeyCode::Right);
+            snap(&mut terminal, &app);
+        }
+
+        // 4. Give LED 3 a second color and blink between the two.
+        press(&mut app, KeyCode::Char('m'));
+        snap(&mut terminal, &app);
+        press(&mut app, KeyCode::Right); // a block for the second color
+        snap(&mut terminal, &app);
+        press(&mut app, KeyCode::Char('m'));
+        press(&mut app, KeyCode::Char('n'));
+        snap(&mut terminal, &app);
+        for _ in 0..6 {
+            app.leds.blink_step();
+            app.apply(&fan);
+            snap(&mut terminal, &app);
+        }
+        press(&mut app, KeyCode::Char('n'));
+        snap(&mut terminal, &app);
+
+        // 5. Take over the fan speed and raise it.
+        for _ in 0..2 {
+            snap(&mut terminal, &app);
+        }
+        for _ in 0..4 {
+            press(&mut app, KeyCode::Up);
+            snap(&mut terminal, &app);
+        }
+
+        eprintln!("captured {frames} frames to {}", dir.display());
+    }
+
+    /// A fan that always succeeds and reports a fixed (but plausible) thermal
+    /// snapshot, so a captured demo shows a complete, healthy UI without
+    /// hardware.
+    struct DemoFan;
+
+    impl FanController for DemoFan {
+        fn write(&self, _colors: &[Color]) -> Result<(), FanError> {
+            Ok(())
+        }
+        fn set_speed(&self, _percent: u8) -> Result<(), FanError> {
+            Ok(())
+        }
+        fn enable_auto_control(&self) -> Result<(), FanError> {
+            Ok(())
+        }
+        fn read_thermal(&self) -> Result<ThermalSnapshot, FanError> {
+            Ok(ThermalSnapshot::new(
+                vec![
+                    crate::fan::SensorReading::new("APU".to_string(), 47),
+                    crate::fan::SensorReading::new("Fan".to_string(), 52),
+                ],
+                vec![crate::fan::FanReading::new("APU Fan".to_string(), 2400)],
+            ))
+        }
+    }
+
+    /// Write one rendered frame to `path` as text: a `cols rows` header, then
+    /// one line per row, each cell as `<symbol>\x1e<fg r,g,b>\x1e<bg r,g,b>`
+    /// with cells separated by `\x1f`. The control separators never appear in
+    /// terminal content, so the format is unambiguous.
+    fn write_frame(path: &std::path::Path, buffer: &ratatui::buffer::Buffer) {
+        let area = buffer.area();
+        let mut out = String::new();
+        out.push_str(&format!("{} {}\n", area.width, area.height));
+        for y in 0..area.height {
+            for x in 0..area.width {
+                let cell = &buffer[(x, y)];
+                let (fr, fg, fb) = fg_rgb(cell.fg);
+                let (br, bg, bb) = bg_rgb(cell.bg);
+                out.push_str(cell.symbol());
+                out.push('\u{1e}');
+                out.push_str(&format!("{fr},{fg},{fb}"));
+                out.push('\u{1e}');
+                out.push_str(&format!("{br},{bg},{bb}"));
+                out.push('\x1f');
+            }
+            out.push('\n');
+        }
+        std::fs::write(path, out).expect("write the frame file");
+    }
+
+    /// A cell's foreground as RGB: truecolor passes through, the named colors
+    /// map to a standard 16-color palette, and the terminal default (reset) is
+    /// a light gray.
+    fn fg_rgb(color: RColor) -> (u8, u8, u8) {
+        rgb_of(color, (214, 214, 214))
+    }
+
+    /// A cell's background as RGB: like [`fg_rgb`], but the terminal default
+    /// (reset) is black.
+    fn bg_rgb(color: RColor) -> (u8, u8, u8) {
+        rgb_of(color, (0, 0, 0))
+    }
+
+    /// Map a color to RGB, substituting `reset` for the terminal default.
+    fn rgb_of(color: RColor, reset: (u8, u8, u8)) -> (u8, u8, u8) {
+        match color {
+            RColor::Rgb(r, g, b) => (r, g, b),
+            RColor::Reset => reset,
+            RColor::Indexed(i) => indexed_rgb(i),
+            RColor::Black => (0, 0, 0),
+            RColor::Red => (204, 0, 0),
+            RColor::Green => (0, 204, 0),
+            RColor::Yellow => (204, 204, 0),
+            RColor::Blue => (0, 0, 204),
+            RColor::Magenta => (204, 0, 204),
+            RColor::Cyan => (0, 204, 204),
+            RColor::Gray => (128, 128, 128),
+            RColor::DarkGray => (96, 96, 96),
+            RColor::LightRed => (255, 85, 85),
+            RColor::LightGreen => (85, 255, 85),
+            RColor::LightYellow => (255, 255, 85),
+            RColor::LightBlue => (85, 85, 255),
+            RColor::LightMagenta => (255, 85, 255),
+            RColor::LightCyan => (85, 255, 255),
+            RColor::White => (255, 255, 255),
+        }
+    }
+
+    /// The standard 256-color (xterm) palette (only the 16-color basic palette
+    /// is approximated, as this app never uses indexed colors).
+    fn indexed_rgb(i: u8) -> (u8, u8, u8) {
+        if i < 16 {
+            let gray = 8 * i;
+            return (gray, gray, gray);
+        }
+        if i < 232 {
+            let i = (i - 16) as usize;
+            let levels = [0u8, 95, 135, 175, 215, 255];
+            return (levels[i / 36], levels[(i / 6) % 6], levels[i % 6]);
+        }
+        let v = (8 + (i as usize - 232) * 10) as u8;
+        (v, v, v)
+    }
 }
