@@ -82,5 +82,4 @@ mod tests {
         assert_eq!(Color::from_hue(45.0), Color::new(255, 191, 0), "orange");
         assert_eq!(Color::from_hue(-90.0), Color::new(128, 0, 255), "violet");
     }
-
 }

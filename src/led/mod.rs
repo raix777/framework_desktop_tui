@@ -10,7 +10,7 @@
 //! and translates key presses into changes:
 //! - `1`..`8` — select the LED with that number (no fan write needed)
 //! - `r`/`R`, `g`/`G`, `b`/`B` — increase / decrease the selected channel
-//! - `c` — toggle the target LED(s) between off (black) and the color they
+//! - `d` — toggle the target LED(s) between off (black) and the color they
 //!   had before, in whichever color the color keys are editing
 //! - `w` — toggle the rainbow preset: on, every LED takes one hue of the
 //!   color wheel in whichever color the color keys are editing (the whole
@@ -35,7 +35,7 @@
 //! - `o`/`p` — decrease / increase the blink rate, from 0.1 to 10 hz
 //!
 //! Each LED holds two colors: the main color (shown while the blink is off)
-//! and a second color it blinks to while the blink is on. `c` and the
+//! and a second color it blinks to while the blink is on. `d` and the
 //! rainbow preset act on whichever color the color keys are editing. The
 //! rotation is per layer: each color layer has its own rotation (on/off,
 //! direction, and speed), controlled while that layer is being edited, and
@@ -50,7 +50,7 @@ mod rotation;
 pub use bank::LedBank;
 pub use blink::BlinkSpeed;
 pub use channel::Channel;
-pub use rotation::RotationDirection;
+pub use rotation::{LayerRotation, RotationDirection, RotationSpeed};
 
 use crate::fan::Color;
 
@@ -62,7 +62,7 @@ pub const COLOR_STEP: i16 = 1;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Led {
     number: u8,
-    /// The LED's main color: shown while the blink is off, and the one `c`,
+    /// The LED's main color: shown while the blink is off, and the one `d`,
     /// the rainbow preset, and the rotation act on.
     color: Color,
     /// The LED's second color: the one it blinks to while the blink is on.

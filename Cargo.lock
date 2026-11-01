@@ -472,6 +472,7 @@ version = "0.1.0"
 dependencies = [
  "crossterm",
  "framework_lib",
+ "libc",
  "ratatui",
 ]
 

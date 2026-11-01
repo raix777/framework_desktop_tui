@@ -34,6 +34,14 @@ impl BlinkSpeed {
         }
     }
 
+    /// The rate closest to `hertz` (in tenths), clamped to the limits.
+    pub fn from_hertz(hertz: f64) -> Self {
+        let tenths = (hertz * 10.0).round();
+        Self {
+            tenths: tenths.clamp(Self::MIN_TENTHS as f64, Self::MAX_TENTHS as f64) as u16,
+        }
+    }
+
     /// The rate in hertz (color changes per second), e.g. `2.0` for two
     /// changes per second or `0.1` for one change every 10 s.
     pub fn hertz(&self) -> f64 {
@@ -57,8 +65,7 @@ impl BlinkSpeed {
     /// it, clamped to the slowest blink.
     pub fn decrease(&mut self) {
         let step = self.step(false);
-        self.tenths =
-            ((self.tenths as i16) - (step as i16)).max(Self::MIN_TENTHS as i16) as u16;
+        self.tenths = ((self.tenths as i16) - (step as i16)).max(Self::MIN_TENTHS as i16) as u16;
     }
 
     /// The step for a press moving in the `up` direction, at the current
@@ -91,7 +98,11 @@ mod tests {
     fn blink_speed_starts_at_the_default() {
         let speed = BlinkSpeed::new();
         assert_eq!(speed.hertz(), 1.0, "one change per second");
-        assert_eq!(speed.interval(), Duration::from_secs(1), "a change every 1 s");
+        assert_eq!(
+            speed.interval(),
+            Duration::from_secs(1),
+            "a change every 1 s"
+        );
     }
 
     /// `interval` is the inverse of the rate: 1 s / hz.
@@ -146,5 +157,24 @@ mod tests {
         let mut bottom = at(1);
         bottom.decrease();
         assert_eq!(bottom.hertz(), 0.1, "0.1 hz cannot go slower");
+    }
+
+    /// `from_hertz` rounds to the nearest tenth and clamps to the limits, so
+    /// a saved rate round-trips through the file unchanged.
+    #[test]
+    fn from_hertz_rounds_to_the_nearest_tenth_and_clamps() {
+        assert_eq!(BlinkSpeed::from_hertz(1.0).hertz(), 1.0, "exact");
+        assert_eq!(BlinkSpeed::from_hertz(0.96).hertz(), 1.0, "rounds up");
+        assert_eq!(BlinkSpeed::from_hertz(3.0).hertz(), 3.0, "a coarse stop");
+        assert_eq!(
+            BlinkSpeed::from_hertz(0.04).hertz(),
+            0.1,
+            "clamps at the slowest"
+        );
+        assert_eq!(
+            BlinkSpeed::from_hertz(10.5).hertz(),
+            10.0,
+            "clamps at the fastest"
+        );
     }
 }

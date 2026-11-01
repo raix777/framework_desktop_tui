@@ -48,8 +48,7 @@ main and the second color, `n` toggles the two-color blink, and while it is
 on every LED changes between its two colors at the blink rate (one change per
 second by default, `o`/`p` set the rate from 0.1 to 10 hz). A second color
 starts off (black), so a blink runs between the main color and off until it
-is set. Like the rotation, the second colors and the blink are not kept
-between runs — only the main colors are restored on start.
+is set.
 
 The fan speed is left to the EC at startup (the EC cannot report it back), so
 the vertical speed bar to the left of the circle is not shown until you take
@@ -64,10 +63,17 @@ To the right of the ring, a panel shows the EC's temperature sensors and fan
 speeds (the same data `framework_tool --thermal` prints), refreshed every
 2000 ms — the interval is shown in the panel's title.
 
-On start the app restores the colors it set last time, so it never overwrites
-a lit fan (the EC cannot report the current colors, so the app keeps them in
-`~/.local/state/framework_desktop_tui/leds.txt`). When every LED is off, it
-lights the fan with a rainbow instead of forcing a color.
+On start the app restores the session it left last time — the main and second
+colors of every LED, the rotations, the blink, and the fan speed — so it
+never overwrites a lit fan (the EC cannot report the current colors, so the
+app keeps them in `~/.local/state/framework_desktop_tui/leds.txt`). On the
+first run, with no saved session, it lights the fan with a rainbow.
+
+Press `c` to hand the fan over to a background process: the TUI saves the
+whole session, starts a detached copy of the binary that keeps the effects
+running, and exits, giving the terminal back to the shell. Running the binary
+again takes the fan back (stopping the background process) and restores the
+session, so the TUI picks up where you left it.
 
 ## Requirements
 
@@ -96,7 +102,11 @@ sudo ./target/release/framework_desktop_tui
 |              | that block's color                                 |
 | `m`          | toggle which color the color keys edit: the LED's  |
 |              | main color or its second one (off by default)      |
-| `c`          | toggle the target LED between off (black) and the  |
+| `c`          | hand the fan over to a background process: the TUI |
+|              | saves the session, starts the background process,  |
+|              | and exits; run the binary again to take the fan    |
+|              | back and restore the session                       |
+| `d`          | toggle the target LED between off (black) and the  |
 |              | color it had before                                |
 | `w`          | toggle the rainbow preset: every LED takes one hue |
 |              | of the color wheel (LED 1 red, stepping around the |

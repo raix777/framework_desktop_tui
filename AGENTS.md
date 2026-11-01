@@ -22,15 +22,24 @@ unit-testable without hardware.
 - `src/led/` — per-LED state + key-press→change logic, split by unit:
   `Led` in `mod.rs`, plus `bank.rs` (`LedBank`), `channel.rs` (`Channel`),
   `rotation.rs` (`RotationDirection`). No terminal, no hardware.
+- `src/effects.rs` — `EffectEngine`: the scheduled effects (rotation and blink
+  deadlines) and the tick decision (`TickOutcome`), shared by the TUI loop and
+  the background engine so both keep the fan in step. No hardware, no terminal.
 - `src/tui.rs` — presentation: event loop, key handling, ratatui drawing, `App`.
   Talks to the fan only through `FanController`, never through `framework_lib`.
-- `src/state.rs` — persistence: saves/restores the colors, because the EC cannot
-  read them back.
-- `src/main.rs` — wires it together: `tui::run(&FrameworkFan)`.
+- `src/background.rs` — the background engine: `run_engine` (the detached copy
+  of the binary that keeps the effects running, selected by `--engine`),
+  `spawn_engine`/`takeover` (start it with `c`, stop it on the next start), and
+  the engine pid file.
+- `src/state.rs` — persistence: saves/restores the session (main and second
+  colors, rotations, blink, speed), because the EC cannot read them back.
+- `src/main.rs` — wires it together: `--engine` runs the background engine,
+  otherwise `takeover()` + `tui::run(&FrameworkFan)`.
 
 Rules:
-- Keep `fan/` and `led/` free of hardware and terminal so they stay
-  testable. New hardware/transport goes behind `FanController`, not into the TUI.
+- Keep `fan/`, `led/`, and `effects.rs` free of hardware and terminal so they
+  stay testable. New hardware/transport goes behind `FanController`, not into
+  the TUI.
 - Domain types are `Copy` value types; state is explicit (no hidden globals).
 
 ## Build / test / run

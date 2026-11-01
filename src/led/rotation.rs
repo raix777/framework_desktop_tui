@@ -71,6 +71,14 @@ impl RotationSpeed {
         }
     }
 
+    /// The speed closest to `hertz` (in tenths), clamped to the limits.
+    pub fn from_hertz(hertz: f64) -> Self {
+        let tenths = (hertz * 10.0).round();
+        Self {
+            tenths: tenths.clamp(Self::MIN_TENTHS as f64, Self::MAX_TENTHS as f64) as u16,
+        }
+    }
+
     /// The speed in hertz (full rotations per second), e.g. `2.0` for two
     /// rotations per second or `0.1` for one rotation every 10 s.
     pub fn hertz(&self) -> f64 {
@@ -94,8 +102,7 @@ impl RotationSpeed {
     /// it, clamped to the slowest rotation.
     pub fn decrease(&mut self) {
         let step = self.step(false);
-        self.tenths =
-            ((self.tenths as i16) - (step as i16)).max(Self::MIN_TENTHS as i16) as u16;
+        self.tenths = ((self.tenths as i16) - (step as i16)).max(Self::MIN_TENTHS as i16) as u16;
     }
 
     /// The step for a press moving in the `up` direction, at the current
@@ -233,6 +240,31 @@ mod tests {
         assert_eq!(bottom.hertz(), 0.1, "0.1 hz cannot go slower");
     }
 
+    /// `from_hertz` rounds to the nearest tenth and clamps to the limits, so
+    /// a saved speed round-trips through the file unchanged.
+    #[test]
+    fn from_hertz_rounds_to_the_nearest_tenth_and_clamps() {
+        assert_eq!(RotationSpeed::from_hertz(1.0).hertz(), 1.0, "exact");
+        assert_eq!(RotationSpeed::from_hertz(1.04).hertz(), 1.0, "rounds down");
+        assert_eq!(RotationSpeed::from_hertz(0.96).hertz(), 1.0, "rounds up");
+        assert_eq!(RotationSpeed::from_hertz(0.9).hertz(), 0.9, "a fine stop");
+        assert_eq!(
+            RotationSpeed::from_hertz(0.04).hertz(),
+            0.1,
+            "clamps at the slowest"
+        );
+        assert_eq!(
+            RotationSpeed::from_hertz(10.5).hertz(),
+            10.0,
+            "clamps at the fastest"
+        );
+        assert_eq!(
+            RotationSpeed::from_hertz(-1.0).hertz(),
+            0.1,
+            "clamps negative speeds"
+        );
+    }
+
     /// Walking up from the slowest visits every stop once; walking back down
     /// returns to the start.
     #[test]
@@ -272,6 +304,15 @@ impl LayerRotation {
             on: false,
             direction: RotationDirection::Clockwise,
             speed: RotationSpeed::new(),
+        }
+    }
+
+    /// A layer rotation in the given state (for restoring a saved session).
+    pub fn new_state(on: bool, direction: RotationDirection, speed: RotationSpeed) -> Self {
+        Self {
+            on,
+            direction,
+            speed,
         }
     }
 
@@ -335,6 +376,19 @@ mod layer_rotation_tests {
         let mut rotation = LayerRotation::new();
         assert!(rotation.toggle(), "the first toggle turns it on");
         assert!(!rotation.toggle(), "the second toggle turns it off");
+    }
+
+    /// `new_state` builds a layer rotation in the given state.
+    #[test]
+    fn new_state_builds_the_given_state() {
+        let rotation = LayerRotation::new_state(
+            true,
+            RotationDirection::CounterClockwise,
+            RotationSpeed::from_hertz(2.0),
+        );
+        assert!(rotation.on());
+        assert_eq!(rotation.direction(), RotationDirection::CounterClockwise);
+        assert_eq!(rotation.speed().hertz(), 2.0);
     }
 
     /// A layer rotation keeps its own direction and speed.

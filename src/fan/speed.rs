@@ -44,6 +44,11 @@ impl SpeedControl {
         }
     }
 
+    /// A speed control in the given state (for restoring a saved session).
+    pub fn with_state(state: SpeedState, percent: u8) -> Self {
+        Self { percent, state }
+    }
+
     pub fn percent(&self) -> u8 {
         self.percent
     }
@@ -101,6 +106,14 @@ impl SpeedControl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `with_state` restores the given state and speed.
+    #[test]
+    fn with_state_restores_the_given_state() {
+        let control = SpeedControl::with_state(SpeedState::Auto, 67);
+        assert_eq!(control.state(), SpeedState::Auto);
+        assert_eq!(control.percent(), 67);
+    }
 
     #[test]
     fn speed_control_starts_disabled() {

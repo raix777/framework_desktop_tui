@@ -5,6 +5,8 @@ edition = "2024"
 
 [dependencies]
 crossterm = "0.28.1"
+# POSIX signals and process control, for the background engine handoff.
+libc = "0.2"
 # Library crate of the FrameworkComputer/framework-system repo
 # (provides the EC access used by `framework_tool --rgbkbd ...`).
 # `default-features = false` skips the USB/HID modules we don't use.

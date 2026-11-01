@@ -11,7 +11,7 @@ use crate::fan::{Color, LED_COUNT};
 /// whole set in order for `FanController::write`.
 ///
 /// Each LED has two colors: the main color and a second one it blinks to. The
-/// color keys, `c`, and the rainbow preset act on whichever color is active
+/// color keys, `d`, and the rainbow preset act on whichever color is active
 /// (the main one by default). The rotation is per layer: each color layer has
 /// its own rotation (on/off, direction, speed), controlled while that layer
 /// is being edited, and it moves only its own colors around the ring. The
@@ -338,12 +338,31 @@ impl LedBank {
         }
     }
 
+    /// Set the given layer's rotation state, restoring a saved session.
+    pub fn set_rotation(&mut self, secondary: bool, rotation: LayerRotation) {
+        *self.rotation_slot_mut(secondary) = rotation;
+    }
+
+    /// The given layer's full rotation state (on, direction, speed).
+    pub fn rotation_state(&self, secondary: bool) -> LayerRotation {
+        *self.rotation_slot(secondary)
+    }
+
     /// The rotation state of the given layer.
     fn rotation_slot(&self, secondary: bool) -> &LayerRotation {
         if secondary {
             &self.rotation_secondary
         } else {
             &self.rotation_main
+        }
+    }
+
+    /// The rotation state of the given layer, for mutating it.
+    fn rotation_slot_mut(&mut self, secondary: bool) -> &mut LayerRotation {
+        if secondary {
+            &mut self.rotation_secondary
+        } else {
+            &mut self.rotation_main
         }
     }
 
@@ -403,6 +422,14 @@ impl LedBank {
     pub fn blink_step(&mut self) {
         self.phase = !self.phase;
     }
+
+    /// Set the blink state, restoring a saved session; like turning it on,
+    /// the blink starts on the main colors.
+    pub fn set_blink(&mut self, on: bool, speed: BlinkSpeed) {
+        self.blink = on;
+        self.phase = false;
+        self.blink_speed = speed;
+    }
 }
 
 impl LedBank {
@@ -432,6 +459,19 @@ impl LedBank {
     /// second colors and the blink are session state (like the rotation).
     pub fn primary_colors(&self) -> Vec<Color> {
         self.leds.iter().map(|led| led.color()).collect()
+    }
+
+    /// Set every LED's second color (in ring order), restoring a saved
+    /// session.
+    pub fn set_second_colors(&mut self, colors: [Color; LED_COUNT]) {
+        for (led, color) in self.leds.iter_mut().zip(colors) {
+            led.set_secondary(color);
+        }
+    }
+
+    /// The LEDs' second colors in ring order (the blink targets).
+    pub fn secondary_colors(&self) -> Vec<Color> {
+        self.leds.iter().map(|led| led.secondary()).collect()
     }
 }
 
@@ -707,6 +747,56 @@ mod tests {
             bank.rotation_direction(true),
             RotationDirection::Clockwise,
             "the second layer is clockwise too"
+        );
+    }
+
+    /// `set_rotation` restores the given layer's rotation state, leaving the
+    /// other layer alone.
+    #[test]
+    fn set_rotation_restores_only_the_given_layer() {
+        let mut bank = red_bank();
+        bank.set_rotation(
+            true,
+            LayerRotation::new_state(
+                true,
+                RotationDirection::CounterClockwise,
+                RotationSpeed::from_hertz(2.0),
+            ),
+        );
+
+        assert!(bank.rotation_on(true), "the layer is on");
+        assert_eq!(
+            bank.rotation_direction(true),
+            RotationDirection::CounterClockwise,
+            "the layer's direction is restored"
+        );
+        assert_eq!(
+            bank.rotation_speed(true).hertz(),
+            2.0,
+            "the layer's speed is restored"
+        );
+        assert!(!bank.rotation_on(false), "the other layer is untouched");
+    }
+
+    /// `rotation_state` yields the layer's full rotation state.
+    #[test]
+    fn rotation_state_yields_the_layer_state() {
+        let mut bank = red_bank();
+        bank.toggle_rotation();
+        bank.flip_direction();
+
+        assert_eq!(
+            bank.rotation_state(false),
+            LayerRotation::new_state(
+                true,
+                RotationDirection::CounterClockwise,
+                RotationSpeed::new()
+            )
+        );
+        assert_eq!(
+            bank.rotation_state(true),
+            LayerRotation::new(),
+            "the other layer keeps its default state"
         );
     }
 
@@ -1484,6 +1574,44 @@ mod tests {
             bank.primary_colors(),
             vec![Color::new(255, 0, 0); LED_COUNT],
             "the persisted colors stay the main ones"
+        );
+    }
+
+    /// `set_second_colors` stores the given second colors in ring order, and
+    /// `secondary_colors` yields them back.
+    #[test]
+    fn second_colors_round_trip_in_ring_order() {
+        let mut bank = red_bank();
+        let secondaries = std::array::from_fn(|index| Color::new(0, 0, (index + 1) as u8));
+
+        bank.set_second_colors(secondaries);
+
+        assert_eq!(bank.secondary_colors(), secondaries.to_vec());
+        assert_eq!(
+            bank.colors(),
+            red_bank().colors(),
+            "the second colors do not show while the blink is off"
+        );
+    }
+
+    /// `set_blink` restores the blink state; the blink starts on the main
+    /// colors, like turning it on.
+    #[test]
+    fn set_blink_restores_the_blink_state() {
+        let mut bank = red_bank();
+        bank.select(2);
+        bank.toggle_editing();
+        bank.set_color(Color::new(0, 0, 255)); // a lit second color to blink to
+        bank.toggle_editing();
+
+        bank.set_blink(true, BlinkSpeed::from_hertz(0.9));
+
+        assert!(bank.blink_on(), "the blink is on");
+        assert_eq!(bank.blink_speed().hertz(), 0.9, "the rate is restored");
+        assert_eq!(
+            bank.colors()[1],
+            Color::new(255, 0, 0),
+            "on: it starts on the main color"
         );
     }
 
